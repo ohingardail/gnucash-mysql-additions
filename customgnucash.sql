@@ -1,7 +1,7 @@
 /*
 GnuCash MySql routines
 Author : Adam Harrington
-Date : 28 June 2014
+Date : 22 November 2014
 */
 
 -- Prequisites
@@ -15,7 +15,6 @@ Date : 28 June 2014
 -- Adding or changing data in the gnucash database outside the GnuCash application is not supported; be aware of the risk!
 -- Specifically, the GnuCash client won't be aware of changes made this way until it is restarted.
 
-
 -- A non-GnuCash database should be used 
 -- we want to minimise interference with default GnuCash behaviour or upgrade paths
 use customgnucash;
@@ -26,7 +25,6 @@ set sql_mode=PIPES_AS_CONCAT;
 
 delimiter //
 
--- [A] Base functionality
 
 -- [A.1] Logging table
 create table if not exists log (
@@ -298,7 +296,7 @@ call post_variable ('Inheritance tax nil rate band 2015', '325000');
 call post_variable ('Inheritance tax rate 2015', '0.4'); 
 //
 
--- [A.4] MySQL doesnt-support-arrays workaround
+-- [A.3] MySQL doesnt-support-arrays workaround
 -- this workaround uses CSV strings instead
 
 -- gets a +ve or -ve numbered element from a CSV list 
@@ -380,7 +378,7 @@ begin
 end;
 //
 
--- [A.5] Miscellaneous standalone routines
+-- [A.4] Miscellaneous standalone routines
 
 -- converts a number into an html 'bar' (used for emailing simple graphical results)
 drop function if exists html_bar;
@@ -2352,7 +2350,7 @@ procedure_block : begin
 
 	-- print report
 	select
-		replace(account, 'ASSETS:', '')			as "Account",
+		replace(replace(account, 'ASSETS:', ''), ':', '<br>')		as "Account",
 
 		ifnull(round(realised_gains,2), '&nbsp;')		as "Realised gains",
 		if( ifnull( realised_gains,0 ) = 0 or ifnull( sold_cost,0 ) = 0, 
@@ -3138,7 +3136,15 @@ procedure_block : begin
 		set l_previous_denom 	= get_commodity_latest_denom( get_commodity_guid( trim( p_symbol )));
 		set l_previous_currency = get_commodity_currency( get_commodity_guid( trim( p_symbol )));
 
-		-- gnc-fq-dump has the occasional tendency to report the p_last value as 1/100 of the true value
+		-- gnc-fq-dump (or yahoo) has the occasional tendency to report the prices a factor of 100 out
+		if 	abs(p_last - l_previous_price) / l_previous_price >= 0.95 then
+			if p_last > l_previous_price then
+				set p_last = p_last / 100;
+			else
+				set p_last = p_last * 100;
+			end if;
+		end if;
+
 		-- if values appear sane, and are different from the previous, then insert them
 		if 	l_previous_price is null -- this is the first quote
 			or 
@@ -3177,6 +3183,11 @@ procedure_block : begin
 
 			-- log action
 			call log('Inserted new price ' || p_currency || convert(p_last, char) || ' for ' || if( is_currency( get_commodity_guid(trim(p_symbol)) ) , 'currency ', 'commodity ') || trim(p_symbol) );
+
+		-- else
+
+			-- log action
+			-- call log('Did NOT insert new price ' || p_currency || convert(p_last, char) || ' for ' || if( is_currency( get_commodity_guid(trim(p_symbol)) ) , 'currency ', 'commodity ') || trim(p_symbol) );
 
 		end if;
 	end if;
