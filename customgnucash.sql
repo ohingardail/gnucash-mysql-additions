@@ -1,7 +1,7 @@
 /*
 GnuCash MySql routines
 Author : Adam Harrington
-Date : 29 May 2015
+Date : 12 June 2015
 */
 
 -- Customgnucash actions below are marked [R] if they require Readonly access to the gnucash database, [W] Writeonly and [RW] for both.
@@ -61,7 +61,7 @@ Date : 29 May 2015
 -- PIPES_AS_CONCAT ('something' || 'something else') it only used when create log messages; concat('something','something else') is more standard
 -- set sql_mode=PIPES_AS_CONCAT;
 
--- mandatorily set delimited (otherwise MySQL/MariaDB parser throws a fit when parsing multiline procedures)
+-- mandatorily set delimiter (otherwise MySQL/MariaDB parser throws a fit when parsing multiline procedures)
 delimiter //
 
 
@@ -133,7 +133,8 @@ where
  drop FUNCTION if exists get_commodity_mnemonic; //                                         
  drop FUNCTION if exists get_commodity_earliest_date; //                                    
  drop FUNCTION if exists get_commodity_ema; //                                              
- drop FUNCTION if exists get_commodity_extreme; //                                          
+ drop FUNCTION if exists get_commodity_extreme_price; //        
+ drop FUNCTION if exists get_commodity_extreme_date; //                                       
  drop FUNCTION if exists get_commodity_latest_date; //                                      
  drop FUNCTION if exists get_commodity_name; //                                             
  drop FUNCTION if exists get_commodity_namespace; //                                        
@@ -161,7 +162,8 @@ where
  drop FUNCTION if exists is_parent; //                                                      
  drop FUNCTION if exists is_placeholder; //                                                 
  drop PROCEDURE if exists get_series; //                                                    
- drop FUNCTION if exists get_so_signal; //                                                  
+ drop FUNCTION if exists get_so_signal; // 
+ drop FUNCTION if exists get_signal; //                                                
  drop FUNCTION if exists get_transactions_value; //                                         
  drop FUNCTION if exists is_used; //                                                        
  drop PROCEDURE if exists log; //                                                           
@@ -170,7 +172,8 @@ where
  drop PROCEDURE if exists post_variable; //                                                 
  drop FUNCTION if exists gnc_lock; //                                                       
  drop PROCEDURE if exists gnc_unlock; //                                                    
- drop FUNCTION if exists prettify; //                                                       
+ drop FUNCTION if exists prettify; //    
+ drop FUNCTION if exists pluralise; //                                                       
  drop PROCEDURE if exists put_commodity_attribute; //                                       
  drop PROCEDURE if exists put_element; //                                                   
  drop PROCEDURE if exists put_variable; //                                                  
@@ -219,7 +222,8 @@ where
  create FUNCTION  get_commodity_mnemonic() returns boolean begin return false; end; //      
  create FUNCTION  get_commodity_earliest_date() returns boolean begin return false; end; // 
  create FUNCTION  get_commodity_ema() returns boolean begin return false; end; //           
- create FUNCTION  get_commodity_extreme() returns boolean begin return false; end; //       
+ create FUNCTION  get_commodity_extreme_price() returns boolean begin return false; end; //    
+ create FUNCTION  get_commodity_extreme_date() returns boolean begin return false; end; //      
  create FUNCTION  get_commodity_latest_date() returns boolean begin return false; end; //   
  create FUNCTION  get_commodity_name() returns boolean begin return false; end; //          
  create FUNCTION  get_commodity_namespace() returns boolean begin return false; end; //     
@@ -236,19 +240,21 @@ where
  create FUNCTION  is_child() returns boolean begin return false; end; //                    
  create FUNCTION  is_child_of() returns boolean begin return false; end; //                 
  create FUNCTION  is_currency() returns boolean begin return false; end; //                 
- create FUNCTION  get_ppo_signal() returns boolean begin return false; end; //              
+ -- create FUNCTION  get_ppo_signal() returns boolean begin return false; end; //              
  create FUNCTION  get_related_account() returns boolean begin return false; end; //         
  create FUNCTION  is_guid() returns boolean begin return false; end; //                     
  create FUNCTION  is_hidden() returns boolean begin return false; end; //                   
  create FUNCTION  is_number() returns boolean begin return false; end; //                   
  create FUNCTION  is_parent() returns boolean begin return false; end; //                   
  create FUNCTION  is_placeholder() returns boolean begin return false; end; //              
- create FUNCTION  get_so_signal() returns boolean begin return false; end; //               
+ -- create FUNCTION  get_so_signal() returns boolean begin return false; end; //
+ create FUNCTION  get_signal() returns boolean begin return false; end; //               
  create FUNCTION  get_transactions_value() returns boolean begin return false; end; //      
  create FUNCTION  is_used() returns boolean begin return false; end; //                     
  create FUNCTION  new_guid() returns boolean begin return false; end; //                    
  create FUNCTION  gnc_lock() returns boolean begin return false; end; //                    
- create FUNCTION  prettify() returns boolean begin return false; end; //                    
+ create FUNCTION  prettify() returns boolean begin return false; end; // 
+ create FUNCTION  pluralise() returns boolean begin return false; end; //                    
  create FUNCTION  is_locked() returns boolean begin return false; end; //                   
  create FUNCTION  post_account() returns boolean begin return false; end; //                
  create FUNCTION  round_timestamp() returns boolean begin return false; end; //             
@@ -739,11 +745,15 @@ create procedure post_commodity_attribute
 procedure_block : begin
 	-- call log( concat('DEBUG : START post_commodity_attribute(', ifnull(p_guid, 'null'), ',' , ifnull(p_field, 'null'), ',' , ifnull(p_date, 'null'), ',' , ifnull(p_value, 'null'), ')' ));
 
-	if p_value is null then
+	-- dont bother trying to insert useless values
+	if p_value is null 
+	or p_value like '%missing%'
+	or length(trim(p_value)) = 0
+	then
 		leave procedure_block;
 	end if;
 
-	-- locking commodity_attribute leads to deadlocks (see propogate_comm_attr)
+	-- locking commodity_attribute here leads to deadlocks (see trigger propogate)
 	if 	exists_commodity(p_guid)
 		and not exists_commodity_attribute(p_guid, p_field, p_date)
 		-- and gnc_lock('commodity_attribute')
@@ -1370,7 +1380,7 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
--- returns true id input looks like a numeral (-ve, 0, integer or floating point)
+-- returns true if input looks like a numeral (-ve, 0, integer or floating point)
 -- regexp needs tidying up (is an IP address really a number?)
 drop function if exists is_number;
 //
@@ -1381,7 +1391,17 @@ create function is_number
 	returns boolean
 	deterministic
 begin
-	declare l_value boolean;
+	declare l_value boolean default false;
+
+	-- trip leading or trailing spaces
+	set p_in = trim(p_in);
+
+	-- short circuit if input is blank
+	if p_in is null 
+	or length(p_in) = 0
+	then
+		return l_value;
+	end if;
 
 	select 	p_in regexp '^[[:digit:]\.]+$'
 	into 	l_value;
@@ -1605,6 +1625,35 @@ set @procedure_count = ifnull(@procedure_count,0) + 1;
 
 -- [C] REPORTING ROUTINES
 
+-- returns pluralised form of p_text if p_number is not 1, ready for use in reports
+-- needs amendment to deal with the many exceptions in English
+drop function if exists pluralise;
+//
+create function pluralise
+	(
+		p_number	decimal(20,6),
+		p_text		varchar(50)
+	)
+	returns varchar(50)
+	no sql
+begin
+	declare l_out varchar(50);
+
+	-- depluralise first to start with known 
+	set p_text = trim(trailing 's' from p_text);
+
+	if p_number != 1 then
+		set l_out = concat(trim( trailing '.' from trim( both '0' from convert(p_number, char))), ' ', p_text, 's');
+	else
+		set l_out = concat('one ', p_text);
+	end if;
+
+	return l_out;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
 -- converts a decimal to 2 dp and a character string, or '&nbsp;' (an HTML non-breaking space) if null or zero
 -- used to 'prettify' HTML reports and ensure no MySQL collation errors or concat-returns-null-if-anything-concated-is-already-null problems
 drop function if exists prettify;
@@ -1626,11 +1675,6 @@ begin
 		else 
 			set l_value = convert( round(	p_value, 2), char);		
 	end case;
-
-	-- if( 	ifnull(p_value,0) = 0,
-	--		'&nbsp;',
-	--		convert( round(	p_value, 2), char)
-	--	);
 
 	return l_value;
 end;
@@ -2557,14 +2601,14 @@ set @function_count = ifnull(@function_count,0) + 1;
 
 -- [R] gets extreme HIGH or LOW for commodity in previous p_days days before p_date
 -- returns value in a given currency, or by default (p_currency=null) just uses the native currency of the holding  
-drop function if exists get_commodity_extreme;
+drop function if exists get_commodity_extreme_price;
 //
-create function get_commodity_extreme
+create function get_commodity_extreme_price
 	(
 		p_guid			varchar(32), 
+		p_mode			varchar(10), -- 'HIGH' or 'LOW'
 		p_date			timestamp,
 		p_days			bigint(20),
-		p_mode			varchar(10), -- 'HIGH' or 'LOW'
 		p_currency		varchar(32)
 	)
 	returns				decimal(20,6)
@@ -2626,6 +2670,69 @@ begin
 	end if;
 
 	return l_value;
+	
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
+-- [R] gets most recent date when the price for a commodity was as HIGH or LOW as at p_date (default, 'now')
+drop function if exists get_commodity_extreme_date;
+//
+create function get_commodity_extreme_date
+	(
+		p_guid			varchar(32), 
+		p_mode			varchar(10), -- 'HIGH' or 'LOW'
+		p_date			timestamp
+	)
+	returns				timestamp
+begin
+	declare l_date		timestamp;
+
+	if not exists_commodity(p_guid) then
+		return null;
+	end if;
+
+	-- set defaults and standardise
+	set p_date = ifnull(p_date, current_date);
+
+	-- check sanity
+	if 	p_mode is null
+		or p_mode not in ('HIGH', 'LOW')
+		or datediff(p_date, get_commodity_latest_date(p_guid)) > ifnull(get_variable('Ignore extremes'),7) -- dont bother calculating for commodities with old quotes
+	then
+		return null;
+	end if;
+
+	-- try to play nicely with other procedures
+	do is_locked('prices', 'WAIT');
+
+	case p_mode
+	when 'HIGH' then
+
+		select 	round_timestamp(date)		
+		into 	l_date
+		from	prices
+		where 	commodity_guid = p_guid
+		and 	date < least(p_date, get_commodity_latest_date(p_guid))
+		and 	value_num/value_denom >= get_commodity_price(p_guid, p_date)
+		order by date desc
+		limit 1;
+
+	when 'LOW' then
+
+		select 	round_timestamp(date)		
+		into 	l_date
+		from 	prices
+		where 	commodity_guid = p_guid
+		and 	date < least(p_date, get_commodity_latest_date(p_guid))
+		and 	value_num/value_denom <= get_commodity_price(p_guid, p_date)
+		order by date desc
+		limit 1;
+
+	end case;
+
+	return l_date;
 	
 end;
 //
@@ -3045,6 +3152,7 @@ set @procedure_count = ifnull(@procedure_count,0) + 1;
 -- returns a buy or sell signal based on MACD or PPO
 -- *highly* experimental!!!
 -- NOT TO BE USED TO MAKE BUY OR SELL DECISIONS!
+/*
 drop function if exists get_ppo_signal;
 //
 create function get_ppo_signal
@@ -3108,18 +3216,6 @@ begin
 						l_ppo_histogram
 					);
 
-/*		if l_previous_ppo_line is null then
-			set l_previous_ppo_line = get_commodity_attribute(
-								p_guid,  
-								concat('ppo_line(', l_short_ema_days, ',', l_long_ema_days,')' ), 
-								date_add(l_date, interval - 1 day);
-
-			set l_previous_ppo_histogram = get_commodity_attribute(	
-								p_guid,  
-								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
-								date_add(l_date, interval - 1 day);
-		end if;
-*/
 	
 		if 	l_previous_ppo_line is not null
 			and l_previous_ppo_histogram is not null
@@ -3243,6 +3339,7 @@ end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
 //
+*/
 
 -- [R] returns the SO (stochastic oscillator) of a commodity
 drop procedure if exists get_commodity_so;
@@ -3361,8 +3458,8 @@ procedure_block : begin
 			-- set next day
 			set l_date = date_add( l_date, interval 1 day);
 
-			set l_low = get_commodity_extreme(p_guid, l_date, l_days, 'LOW', null);
-			set l_high = get_commodity_extreme(p_guid, l_date, l_days, 'HIGH', null);
+			set l_low = get_commodity_extreme_price(p_guid, 'LOW', l_date, l_days, null);
+			set l_high = get_commodity_extreme_price(p_guid, 'HIGH', l_date, l_days, null);
 
 			set p_so_fast_line = 100 * ( 	( get_commodity_price(p_guid, l_date) - l_low) 
 							/ 
@@ -3447,6 +3544,7 @@ set @procedure_count = ifnull(@procedure_count,0) + 1;
 -- returns an overbought/oversold signal based on SO
 -- *highly* experimental!!!
 -- NOT TO BE USED TO MAKE BUY OR SELL DECISIONS!
+/*
 drop function if exists get_so_signal;
 //
 create function get_so_signal
@@ -3547,6 +3645,474 @@ end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
 //
+*/
+
+-- [R] 
+-- Uses percentage price osciallator (PPO), stochastic osciallator (SO) and price extremes to make a buy or sell recommendation, based on your preset target allocations
+-- *Highly experimental* and should not be used to make actual buy or sell decisions.
+-- THE AUTHOR HAS NO RESPONSIBILITY FOR DECISIONS MADE BASED IN THIS FUNCTION, OR ERRORS MADE BY THIS FUNCTION!
+drop function if exists get_signal;
+//
+create function get_signal
+	(
+		p_guid		varchar(32), -- commodity being watched
+		p_unit_change	decimal(20,6), -- -ve number means sell, +ve : buy (absolute value is irrelevant)
+		p_date		timestamp
+	)
+	returns 	text
+begin
+	declare l_report 		text default null; 
+	declare l_verbose_report 	text default null;
+	declare l_conclusion		varchar(100); 
+	declare l_date			timestamp;
+	declare l_vote			decimal(6,3);
+	declare l_observation 		varchar(100);
+
+	-- SO variables
+	declare l_fast_so_line 		decimal(6,3);
+	declare l_slow_so_line		decimal(6,3);
+	declare l_signal_line		decimal(6,3);
+
+	-- PPO variables
+	declare l_ppo_line 			decimal(6,3);
+	declare l_ppo_signal_line		decimal(6,3);
+	declare l_ppo_histogram			decimal(6,3);
+	declare l_short_ema_days		tinyint;
+	declare l_long_ema_days			tinyint;
+	declare l_signal_days			tinyint;
+	declare l_gradient_sensitivity		decimal(2,1);
+	declare l_ppo_line_gradient		decimal(4,3);
+	declare l_ppo_histogram_gradient	decimal(4,3);
+	declare l_previous_ppo_line 		decimal(6,3) default null;
+	declare l_previous_ppo_histogram	decimal(6,3) default null;
+
+	-- extremes variables
+	declare l_days_since_high		tinyint;
+	declare l_days_since_low		tinyint;
+
+	call log( concat('DEBUG : START get_signal(', ifnull(p_guid, 'null'), ',', ifnull(p_unit_change, 'null'), ',', ifnull(p_date, 'null'), ')'));
+
+	if 	not exists_commodity(p_guid) 
+		or p_guid = get_default_currency_guid() -- no report for default currency
+		or ifnull(p_unit_change,0) = 0 -- no report if no change in holding required
+	then
+		return l_report;
+	end if;
+
+	-- set defaults and initialise
+	set p_date = round_timestamp(ifnull(p_date, date_add(current_timestamp, interval -1 day) ));
+	set l_date = round_timestamp(date_add(p_date, interval - ifnull(get_variable('Days back'), 3) day));
+	set l_short_ema_days = ifnull(get_variable('Short EMA days'), 12);
+	set l_long_ema_days = ifnull(get_variable('Long EMA days'), 26);
+	set l_signal_days = ifnull(get_variable('Signal days'), 9);
+	set l_gradient_sensitivity = ifnull(get_variable('Gradient sensitivity'), 0.01);
+
+	-- create table to hold poll results
+	drop temporary table if exists poll;
+	create temporary table poll (
+		metric			varchar(100),
+		metric_date		timestamp,
+		observation		varchar(100),
+		vote			tinyint, -- +ve vote = buy, -ve vote = sell
+		primary key (metric)
+	);
+
+	repeat
+		-- [START] PPO analysis
+		set l_vote = 0;
+		set l_observation = null;
+
+		call get_commodity_ppo(	
+					p_guid, 
+					l_date,
+					l_ppo_line,
+					l_ppo_signal_line,
+					l_ppo_histogram
+				);
+
+		if 	l_previous_ppo_line is not null
+			and l_previous_ppo_histogram is not null
+		then
+
+			set l_ppo_line_gradient = l_ppo_line - l_previous_ppo_line;
+			set l_ppo_histogram_gradient = l_ppo_histogram - l_previous_ppo_histogram;
+
+			-- V EARLY : divergences
+			-- if l_ppo_histogram has been decreasing for 4 days
+			-- and l_ppo_signal_line is -ve : BUY
+			-- and l_ppo_signal_line is +ve : SELL
+
+			if 	get_commodity_attribute(	p_guid,  
+								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
+								date_add(l_date, interval - 3 day)
+							)
+				>
+				get_commodity_attribute(	p_guid,  
+								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
+								date_add(l_date, interval - 2 day)
+							)
+				>
+				get_commodity_attribute(	p_guid,  
+								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
+								date_add(l_date, interval - 1 day)
+							)
+				>
+				get_commodity_attribute(	p_guid,  
+								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
+								l_date
+							)
+			then
+
+				if l_ppo_signal_line < 0 then
+					set l_vote = 1;
+					set l_observation = 'Very early buy';
+				elseif l_ppo_signal_line > 0 then
+					set l_vote = -1;
+					set l_observation = 'Very early sell';	
+				end if;
+
+			end if;
+
+			-- EARLY : ppo_line zero crossover
+			-- ppo_line has crossed zero line
+
+			-- try to avoid emitting crossover signals in a ranging market
+			if 	l_ppo_line_gradient is not null
+				and abs(l_ppo_line_gradient) >= l_gradient_sensitivity
+				and (
+					(	l_ppo_line > 0
+						and l_previous_ppo_line	<= 0
+					)
+					or
+					(
+						l_ppo_line < 0
+						and l_previous_ppo_line >= 0
+					)
+				)
+			then
+
+				if l_ppo_line_gradient > 0 then
+					set l_vote = 2;
+					set l_observation = 'Early buy';
+				elseif l_ppo_line_gradient < 0 then
+					set l_vote = -2;
+					set l_observation = 'Early sell';	
+				end if;
+
+			end if;
+
+			-- LATE : ppo_line signal line crossover
+			-- ppo_line has crossed signal line
+
+			-- try to avoid emitting crossover signals in a ranging market
+			if 	l_ppo_histogram_gradient is not null
+				and abs(l_ppo_histogram_gradient ) >= l_gradient_sensitivity
+				and (
+					(
+						l_ppo_histogram > 0
+						and l_previous_ppo_histogram <= 0	
+					) 
+					or 
+					(
+						l_ppo_histogram < 0
+						and l_previous_ppo_histogram >= 0
+					)
+				)
+			then
+
+				if l_ppo_line_gradient > 0 then
+					set l_vote = 3;
+					set l_observation = 'Late buy';
+				elseif l_ppo_line_gradient < 0 then
+					set l_vote = -3;
+					set l_observation = 'Late sell';	
+				end if;
+				
+			end if;
+		end if;
+
+		-- call log( concat('DEBUG : [PPO] l_vote = ', ifnull(l_vote, 'null')));
+		-- call log( concat('DEBUG : [PPO] l_observation = ', ifnull(l_observation, 'null')));
+
+		if ifnull(l_vote,0) != 0 
+		then
+			replace into poll
+				(metric, metric_date, observation, vote)
+			values
+				(
+					'Percentage price oscillator', 
+					l_date,
+					l_observation,
+					round(l_vote * ifnull(get_variable('Percentage price oscillator weighting'),1),0)
+				);
+		end if;
+
+		-- remember values for next day
+		set l_previous_ppo_line = l_ppo_line;
+		set l_previous_ppo_histogram = l_ppo_histogram;
+
+		-- [END] PPO analysis
+
+		-- [START] SO analysis
+		call get_commodity_so(	
+					p_guid, 
+					l_date,
+					l_fast_so_line, 
+					l_slow_so_line, 
+					l_signal_line
+				);
+
+		-- (long term) oversold / overbought indicator
+		set l_vote = 0;
+		set l_observation = null;
+		case
+			when l_slow_so_line < 10 then set l_vote = 3; set l_observation = 'Very oversold';
+			when l_slow_so_line < 20 then set l_vote = 2; set l_observation = 'Oversold';
+			when l_slow_so_line < 30 then set l_vote = 1; set l_observation = 'Mildly oversold';
+			when l_slow_so_line > 90 then set l_vote = -3; set l_observation = 'Very overbought';
+			when l_slow_so_line > 80 then set l_vote = -2; set l_observation = 'Overbought';
+			when l_slow_so_line > 70 then set l_vote = -1; set l_observation = 'Mildly overbought';
+			else set l_vote = 0;	
+		end case;
+
+		-- call log( concat('DEBUG : [LTSO] l_vote = ', ifnull(l_vote, 'null')));
+		-- call log( concat('DEBUG : [LTSO] l_observation = ', ifnull(l_observation, 'null')));
+
+		if ifnull(l_vote,0) != 0
+		then
+			replace into poll
+				(metric, metric_date, observation, vote)
+			values
+				(
+					'Long term stochastic oscillator', 
+					l_date,
+					l_observation,
+					round(l_vote * ifnull(get_variable('Long term stochastic oscillator weighting'),1),0)
+				);
+		end if;
+
+		-- (short term) oversold / overbought indicator
+		set l_vote = 0;
+		set l_observation = null;
+		case
+			when l_fast_so_line < 10 then set l_vote = 3; set l_observation = 'Very oversold';
+			when l_fast_so_line < 20 then set l_vote = 2; set l_observation = 'Oversold';
+			when l_fast_so_line < 30 then set l_vote = 1; set l_observation = 'Mildly oversold';
+			when l_fast_so_line > 90 then set l_vote = -3; set l_observation = 'Very overbought';
+			when l_fast_so_line > 80 then set l_vote = -2; set l_observation = 'Overbought';
+			when l_fast_so_line > 70 then set l_vote = -1; set l_observation = 'Mildly overbought';
+			else set l_vote = 0;	
+		end case;
+
+		-- call log( concat('DEBUG : [STSO] l_vote = ', ifnull(l_vote, 'null')));
+		-- call log( concat('DEBUG : [STSO] l_observation = ', ifnull(l_observation, 'null')));
+
+		if ifnull(l_vote,0) != 0 
+		then
+			replace into poll
+				(metric, metric_date, observation, vote)
+			values
+				(
+					'Short term stochastic oscillator', 
+					l_date,
+					l_observation,
+					round(l_vote * ifnull(get_variable('Short term stochastic oscillator weighting'),1),0)
+				);
+		end if;
+
+		-- bull/bear divergences
+		-- todo
+
+		-- bull/bear setups
+		-- todo
+
+		-- [END] SO analysis
+
+		-- next day
+		set l_date = date_add(l_date, interval 1 day);
+
+	until l_date > p_date
+	end repeat;
+
+	-- [START] Extremes analysis
+	set l_vote = 0;
+	set l_observation = null;
+
+	set l_days_since_high = datediff(p_date, get_commodity_extreme_date(p_guid, 'HIGH', p_date));
+	set l_days_since_low = datediff(p_date, get_commodity_extreme_date(p_guid, 'LOW', p_date));
+
+	-- ignore differences within 'Ignore extremes' days
+	-- effectively, one vote is given for each quarter (3 months), capped to 5 votes (ie 1.25 years) to avoid overwhelming other signals
+	if ifnull(l_days_since_high,0) > ifnull(get_variable('Ignore extremes'),7) then
+		set l_vote = - l_days_since_high / 91; -- -ve because this is a sell signal
+
+		-- cap vote
+		if l_vote < - ifnull(get_variable('Vote cap'),5) then
+			set l_vote = - ifnull(get_variable('Vote cap'),5);
+		end if;
+			
+		if 	l_days_since_high < 56 then
+			set l_observation = concat( pluralise( round(l_days_since_high / 7, 0), 'week' ), ' since price was this high');
+		elseif l_days_since_high < 365 then
+			set l_observation = concat( pluralise( round(l_days_since_high / 31, 0) , 'month'), ' since price was this high');
+		else
+			set l_observation = concat( pluralise( round(l_days_since_high / 365.25, 1) ,'year'), ' since price was this high');
+		end if;
+	end if;
+
+	if ifnull(l_vote,0) != 0 
+	then
+		replace into poll
+			(metric, metric_date, observation, vote)
+		values
+			(
+				'Extreme high', 
+				p_date,
+				l_observation,
+				round(l_vote * ifnull(get_variable('Extremes weighting'),1),0)
+			);
+	end if;
+
+	if ifnull(l_days_since_low,0) > ifnull(get_variable('Ignore extremes'),7) then
+		set l_vote = l_days_since_low / 91;
+
+		if l_vote > ifnull(get_variable('Vote cap'),5) then
+			set l_vote = ifnull(get_variable('Vote cap'),5);
+		end if;
+			
+		if 	l_days_since_high < 56 then
+			set l_observation = concat( pluralise( round(l_days_since_high / 7, 0), 'week' ), ' since price was this low');
+		elseif l_days_since_high < 365 then
+			set l_observation = concat( pluralise( round(l_days_since_high / 31, 0) , 'month'), ' since price was this low');
+		else
+			set l_observation = concat( pluralise( round(l_days_since_high / 365.25, 1) ,'year'), ' since price was this low');
+		end if;
+	end if;
+
+	-- call log( concat('DEBUG : [extremes] l_vote = ', ifnull(l_vote, 'null')));
+	-- call log( concat('DEBUG : [extremes] l_observation = ', ifnull(l_observation, 'null')));
+
+	if ifnull(l_vote,0) != 0 
+	then
+		replace into poll
+			(metric, metric_date, observation, vote)
+		values
+			(
+				'Extreme low', 
+				p_date,
+				l_observation,
+				round(l_vote * ifnull(get_variable('Extremes weighting'),1),0)
+			);
+	end if;
+
+	-- [END] Extremes analysis
+
+	-- Calculate BUY/SELL conclusion with more weight given to later signals; majority wins
+	select 	sum( vote / if( datediff(p_date, metric_date) <= 1, 1, ( datediff(p_date, metric_date)/2 ) ) )
+	into 	l_vote
+	from 	poll;
+
+	-- call log( concat('DEBUG : l_vote = ', ifnull(l_vote, 'null')));
+
+	-- filter out weak signals if requested
+	if 	abs(l_vote) > ifnull(get_variable('Filter weak signals'), '0') 
+	then
+
+		-- convert votes to text
+		if abs(l_vote) > ifnull(get_variable('Very strong vote'),5) then
+			set l_conclusion = 'VERY STRONG';
+		elseif abs(l_vote) > ifnull(get_variable('Strong vote'),3) then
+			set l_conclusion = 'STRONG';
+		elseif abs(l_vote) > ifnull(get_variable('Mild vote'),1) then
+			set l_conclusion = '';
+		elseif abs(l_vote) > ifnull(get_variable('Weak vote'),0) then
+			set l_conclusion = 'WEAK';
+		end if;
+
+		if p_unit_change < 0 and l_vote < 0 then
+			set l_conclusion = concat('<font color=blue><b>', l_conclusion, ' SELL</b></font>');
+		elseif p_unit_change > 0 and l_vote > 0 then
+			set l_conclusion = concat('<font color=green><b>', l_conclusion, ' BUY</b></font>');
+		else
+			set l_conclusion = null;
+		end if;
+
+		-- call log( concat('DEBUG : l_conclusion = ', ifnull(l_conclusion, 'null')));
+
+		-- add explanation if required
+		if l_conclusion is not null and get_variable('Explain') = 'Verbose' then
+
+			report_block : begin
+				declare l_poll_line		text;
+				declare l_poll_done_temp 	boolean default false;
+				declare l_poll_done		boolean default false;
+
+				declare lc_poll cursor for
+					select distinct
+						concat (date_format(metric_date, '%Y-%m-%d'), '|',
+							metric, '|',
+							observation
+						)
+					from poll
+					order by metric_date desc, metric;
+				declare continue handler for not found set l_poll_done =  true;
+
+				open lc_poll;
+				set l_poll_done = false;
+
+				poll_loop : loop
+					fetch lc_poll into l_poll_line;
+
+					if l_poll_done then 
+						leave poll_loop;
+					else
+						set l_poll_done_temp = l_poll_done;
+					end if;
+
+					call write_report(	l_verbose_report,
+					 			l_poll_line,
+					 			'table-middle');
+
+					set l_poll_done = l_poll_done_temp;
+													
+				end loop; -- poll_loop
+
+				close lc_poll;
+
+			end; -- report_block
+		
+		
+			-- set l_report = 
+
+			call write_report(	l_verbose_report,
+			 			'Metric|Date|Observation',
+			 			'table-start');
+
+			call write_report(	l_verbose_report,
+			 			null,
+						'table-end');
+
+			call write_report(	l_report,
+						l_conclusion,
+						'plain');
+
+			call write_report(	l_report,
+						l_verbose_report,
+						'plain');
+
+		else
+			set l_report = l_conclusion;
+
+		end if;
+	end if;
+
+	call log('DEBUG : END get_signal');
+
+	return l_report;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
 
 -- [RW] Adds a new commodity price to the commodity table
 -- if its sane, and hasn't already been added
@@ -3591,6 +4157,7 @@ begin
 		and p_currency is not null
 		and exists_commodity(p_commodity) 
 		and is_currency(p_currency)
+		and is_number(p_value)
 		and p_date <= current_date
 		and p_date >= date_add(current_date, interval -10 year)
 	then
@@ -3770,14 +4337,15 @@ procedure_block : begin
 			select distinct 
 				commodity_attribute.commodity_guid,
 				commodity_attribute.value_date,
-				commodity_attribute.value,
+				trim(commodity_attribute.value),
 				commodity_attribute.field
 			from	commodity_attribute
 			where 	commodity_attribute.field in ('last', 'price')
+				and is_number(commodity_attribute.value)
 				and commodity_attribute.value_date <= current_date
 				and commodity_attribute.value_date >= date_add(current_date, interval - get_variable('Price check') day)
 				and not exists_price(commodity_attribute.commodity_guid, commodity_attribute.value_date)
-				and commodity_attribute.value != get_commodity_price(commodity_attribute.commodity_guid, commodity_attribute.value_date)
+				-- and commodity_attribute.value != get_commodity_price(commodity_attribute.commodity_guid, commodity_attribute.value_date)
 				and (p_guid is null or p_guid = commodity_attribute.commodity_guid)
 			order by 
 				commodity_attribute.commodity_guid,
@@ -6614,7 +7182,7 @@ procedure_block:begin
 	do is_locked('log', 'WAIT');
 
 	set l_date = ifnull(str_to_date(get_variable('Anomalies reported'), '%Y-%m-%d %H:%i:%S'), date_add(l_current_timestamp, interval -1 year));
-	set l_error_level = ifnull(get_variable('Error level'), 'ERROR');
+	set l_error_level = upper(ifnull(get_variable('Error level'), 'ERROR'));
 
 	open lc_anomaly;	
 	set l_anomaly_done = false;
@@ -7985,9 +8553,9 @@ procedure_block : begin
 	declare	l_sold_cost				decimal(20,6);
 	declare	l_average_cost				decimal(20,6);
 
-	-- declare	l_performance_signal			tinyint;
-	declare l_ppo_signal				text;
-	declare l_so_signal				text;
+	-- declare l_performance_signal			tinyint;
+	-- declare l_ppo_signal				text;
+	-- declare l_so_signal				text;
 
 	declare l_account_list_done 			boolean default false;
 	declare l_account_list_done_temp 		boolean default false;
@@ -8131,11 +8699,12 @@ procedure_block : begin
 
 						if ifnull(l_predicted_gain,0) != 0 then
 							set l_report_recommendation = concat(	l_report_recommendation,
-										'</br>Predicted ',
-										if(ifnull(l_predicted_gain,0) < 0, 'loss ', 'gain '), 
-										get_variable('Default currency'), 
-										prettify( floor( abs( ifnull(l_predicted_gain,0))))
-										);
+												'</br>(Predicted ',
+												if(ifnull(l_predicted_gain,0) < 0, 'loss ', 'gain '), 
+												get_variable('Default currency'), 
+												prettify( floor( abs( ifnull(l_predicted_gain,0)))),
+												')'
+												);
 						end if;
 									
 					elseif l_target_unit_change > 0 then
@@ -8143,7 +8712,7 @@ procedure_block : begin
 						-- call log('DEBUG : E');
 
 						set l_report_recommendation = concat(	l_report_recommendation,
-										'</br>New unit price is ', 
+										'</br>(New unit price is ', 
 										prettify( abs( 	l_current_unit_value_default_currency 
 												- l_original_unit_value_default_currency) * 100
 												/ 
@@ -8152,7 +8721,7 @@ procedure_block : begin
 										'% ',
 										if(l_current_unit_value_default_currency > l_original_unit_value_default_currency, 
 											'higher', 'lower'),
-										' than average purchase price.'
+										' than average purchase price)'
 									);
 					end if; -- if l_target_unit_change < 0
 
@@ -8161,8 +8730,10 @@ procedure_block : begin
 				if  p_mode = 'alert' then
 
 					-- call log('DEBUG : F');
+	
+					set l_alert_recommendation = get_signal(l_commodity_guid, l_target_unit_change, null);
 					
-					set l_so_signal = get_so_signal( l_commodity_guid, null);
+/*					set l_so_signal = get_so_signal( l_commodity_guid, null);
 					set l_ppo_signal = get_ppo_signal( l_commodity_guid, null);
 
 					-- only return accounts that require immediate attention
@@ -8198,20 +8769,20 @@ procedure_block : begin
 							set l_alert_recommendation = concat( ifnull(l_alert_recommendation, ''), l_so_signal);
 						end if;
 
-					end if;
-					
+					end if;					
+*/
 					-- writing report line for 'alert' types
 					if l_alert_recommendation is not null then
 
 						-- call log('DEBUG : M');
 
-						call write_report(	l_alert_recommendation,
-									'Metric|Date|Observation',
-									'table-start');
+						-- call write_report(	l_alert_recommendation,
+						-- 			'Metric|Date|Observation',
+						-- 			'table-start');
 
-						call write_report(	l_alert_recommendation,
-									null,
-									'table-end');
+						-- call write_report(	l_alert_recommendation,
+						-- 			null,
+						--			'table-end');
 
 						call write_report(	l_report,
 									concat(
@@ -8224,9 +8795,10 @@ procedure_block : begin
 									'table-middle'
 								);
 
-					end if; -- if abs(performance_signal) > 5
+					end if; 
 
-				else
+
+				else -- if report is not an alert
 
 					-- call log('DEBUG : N');
 					-- writing report line for 'report' types
@@ -8899,7 +9471,8 @@ procedure_block : begin
 
 	end if;
 
-	-- check prices are being kept up-to-date (non fatal error; user needs to know)
+	-- check prices are being kept up-to-date 
+	-- monthly_housekeeping eventually turns off persistent miscreants
 	if 	get_variable('Gnucash status') = 'RW' then
 
 		-- check how long DB has been RW for
@@ -8919,16 +9492,15 @@ procedure_block : begin
 		if l_integer1 > 7 and l_integer2 > 1 then
 
 			-- count how many commodities have been quoted in the last week
-			select 	count( distinct commodities.guid )
-			into 	l_integer3
+			select 	group_concat( distinct get_commodity_mnemonic(commodities.guid ))
+			into	l_text1
 			from	commodities
-				join prices on commodities.guid = prices.commodity_guid
 			where 	commodities.quote_flag = 1
 			and 	commodities.mnemonic != get_variable('Default currency')
-			and 	datediff(current_timestamp, prices.date) > 7;
+           		and 	datediff(current_date, get_commodity_latest_date(commodities.guid)) > 7;
 
-			if l_integer3 < l_integer2 then
-				call log( concat('WARNING : only ', l_integer3, ' of an expected ', l_integer2, ' quotes have been updated in the last week.'));
+			if l_text1 is not null then
+				call log( concat('WARNING : quotes for commodities ', l_text1, ' have not been updated in the last week.'));
 			end if; 
 
 		end if; -- if l_integer1 > 7
@@ -9005,6 +9577,7 @@ begin
 		call post_all_gains();
 
 		-- TODO run scheduled transactions
+		-- call run_schedule();
 
 	end if; 
 
@@ -9023,6 +9596,7 @@ comment 'Keeps customgnucash structure and data up to date.'
 do
 begin	
 	declare l_default_currency	varchar(50);
+	declare l_unquoted_commodities	varchar(100);
 	declare	l_err_code		char(5) default '00000';
 	declare l_err_msg		text;
 	declare exit handler for SQLEXCEPTION
@@ -9064,6 +9638,30 @@ begin
 			call log( concat('WARNING : your most used currency is "', l_default_currency, '" not the default currency "', get_variable('Default currency'), '". To change it, run (in MySQL) : put_variable(''Default currency'',''', l_default_currency,''');'));
 		end if;
 
+		-- turn off quoting for commodities where a value has not been received for 'Stop quoting' months
+		if get_variable('Gnucash status') =  'RW' then
+
+			select 	group_concat( distinct get_commodity_mnemonic(commodities.guid ))
+			into	l_unquoted_commodities
+			from	commodities
+			where 	commodities.quote_flag = 1
+			and 	commodities.mnemonic != get_variable('Default currency')
+		   	and 	datediff(current_date, get_commodity_latest_date(commodities.guid)) > ifnull(get_variable('Stop quoting'), 6) * 31;
+
+			if l_unquoted_commodities is not null and gnc_lock('commodities') then
+
+				update 	commodities
+				set 	quote_flag = 0
+				where 	commodities.quote_flag = 1
+				and 	commodities.mnemonic != get_variable('Default currency')
+			   	and 	datediff(current_date, get_commodity_latest_date(commodities.guid)) > ifnull(get_variable('Stop quoting'), 6) * 31;
+
+				call gnc_unlock('commodities');
+
+				call log( concat('WARNING : turned off quoting for commodities ', l_unquoted_commodities, ' because no value has been received in ', ifnull(get_variable('Stop quoting'), 6), ' months'));
+
+			end if;
+		end if;
 	end if;
 
 	call log('DEBUG : END EVENT monthly_housekeeping');
@@ -9326,6 +9924,9 @@ call post_variable ('Keep log', '30');
 -- number of days back to check for missing prices (see procedure clean_prices )
 call post_variable ('Price check', '30'); 
 //
+-- number of months for which no quote was received for a commodity, after which quoting is automatically stopped (monthly_housekeeping)
+call post_variable ('Stop quoting', '6'); 
+//
 -- number of days to calculate EMAs, MACDs or PPOs for at initialisation (the longer the more accurate, given the starting position of an SMA)
 call post_variable ('EMA initialisation', '100'); 
 //
@@ -9376,22 +9977,48 @@ call post_variable('House price index', 'XHS');
 -- Report control parameters
 -- Customgnucash reports are stored in a local table and are extracted to console (to email via the OS, or whatever you want to do with them) through the "get_reports" procedure.
 
--- If 'ERROR' then report CustomGnucash ERRORs only; if 'WARNING' then both WARNINGs and ERRORs, if 'INFORMATION', then INFORMATION, WARNING and ERROR reports. 'OFF' means no error reporting
-call post_variable ('Error level', 'ERROR');
+-- If 'Error' then report CustomGnucash ERRORs only; if 'Warning' then both WARNINGs and ERRORs, if 'Information', then INFORMATION, WARNING and ERROR reports. 'Off' means no error reporting (report_anomalies)
+call post_variable ('Error level', 'Error');
 //
 -- Dont run CustomGnucash reports if Reports=N
 call post_variable ('Report', 'Y');
 //
 -- CSS style sheet for reports
--- this is prepended to reports to make HTML look pretty
+-- this is prepended to exported (eg emailed) reports to make HTML look pretty
 call post_variable ('Report CSS','table.main {border-collapse: collapse;width:100%;} table.main th {font-weight: bold;border: 1px solid black;background:silver} table.main td {border: 1px solid black;} table.html_bar {border-collapse: collapse;border: 0px;} table.html_bar th {border: 0px;} table.html_bar td {border: 0px;} table.null_field {border-collapse: collapse;background:lightgray;width:100%} table.null_field th {border: 0px;} table.null_field td {border: 0px;}');
 //
--- the value in "Default Currency" below which reports will not be sent (to filter out piddling chages)
+-- the value in "Default Currency" below which reports will not be sent (to filter out piddling changes)
 call post_variable ('Trivial value', '1000'); 
+//
+-- report should explain decision ('Verbose') or just issue the conclusion ('Concise') (mainly for buy/sell decisions) (see function get_signal)
+call post_variable ('Explain', 'Verbose'); -- or 'Concise' 
+//
+-- weightings and caps used by function get_signal
+call post_variable('Ignore extremes', 14); -- ignore high/low-since-x-days signals for this may days
+//
+call post_variable('Vote cap', 5); -- cap buy/sell votes to avoid overwhelming other signals
+//
+call post_variable('Very strong vote', 5); -- votes above which a signal is considered strong
+//
+call post_variable('Strong vote',3);
+//
+call post_variable('Mild vote',1);
+//
+call post_variable('Weak vote',0);
+//
+call post_variable('Extremes weighting',1); -- weight given to extremes price analysis
+//
+call post_variable('Short term stochastic oscillator weighting',1);
+//
+call post_variable('Long term stochastic oscillator weighting',2);
+//
+call post_variable('Percentage price oscillator weighting',2);
+//
+call post_variable('Filter weak signals',1); -- votes below which a report will not be sent
 //
 
 -- Jurisdiction variables
--- only UK is supported at the moment; other jurisdictions are not set
+-- only UK is supported at the moment; other jurisdictions have no code behind them
 call post_variable ('Jurisdiction', 'UK');
 //
 call post_variable ('Default timezone', 'Europe/London');
