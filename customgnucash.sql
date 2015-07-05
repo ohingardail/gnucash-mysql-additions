@@ -1,7 +1,7 @@
 /*
 GnuCash MySql routines
 Author : Adam Harrington
-Date : 12 June 2015
+Date : 5 July 2015
 */
 
 -- Customgnucash actions below are marked [R] if they require Readonly access to the gnucash database, [W] Writeonly and [RW] for both.
@@ -152,8 +152,7 @@ where
  drop FUNCTION if exists html_bar; //                                                       
  drop FUNCTION if exists is_child; //                                                       
  drop FUNCTION if exists is_child_of; //                                                    
- drop FUNCTION if exists is_currency; //                                                    
- drop FUNCTION if exists get_ppo_signal; //                                                 
+ drop FUNCTION if exists is_currency; //                                                                                                 
  drop FUNCTION if exists get_related_account; //                                            
  drop PROCEDURE if exists get_report; //                                                    
  drop FUNCTION if exists is_guid; //                                                        
@@ -162,7 +161,6 @@ where
  drop FUNCTION if exists is_parent; //                                                      
  drop FUNCTION if exists is_placeholder; //                                                 
  drop PROCEDURE if exists get_series; //                                                    
- drop FUNCTION if exists get_so_signal; // 
  drop FUNCTION if exists get_signal; //                                                
  drop FUNCTION if exists get_transactions_value; //                                         
  drop FUNCTION if exists is_used; //                                                        
@@ -192,7 +190,8 @@ where
  drop FUNCTION if exists post_split; //                                                     
  drop PROCEDURE if exists report_asset_allocation; //                                       
  drop PROCEDURE if exists report_remaining_isa_allowance; //                                
- drop PROCEDURE if exists reschedule; //                                                    
+ drop PROCEDURE if exists reschedule; //  
+ drop PROCEDURE if exists run_schedule; //                                                    
  drop FUNCTION if exists sort_array; //                                                     
  drop PROCEDURE if exists write_report; //                                                  
  create FUNCTION  convert_value() returns boolean begin return false; end; //               
@@ -239,15 +238,13 @@ where
  create FUNCTION  html_bar() returns boolean begin return false; end; //                    
  create FUNCTION  is_child() returns boolean begin return false; end; //                    
  create FUNCTION  is_child_of() returns boolean begin return false; end; //                 
- create FUNCTION  is_currency() returns boolean begin return false; end; //                 
- -- create FUNCTION  get_ppo_signal() returns boolean begin return false; end; //              
+ create FUNCTION  is_currency() returns boolean begin return false; end; //                             
  create FUNCTION  get_related_account() returns boolean begin return false; end; //         
  create FUNCTION  is_guid() returns boolean begin return false; end; //                     
  create FUNCTION  is_hidden() returns boolean begin return false; end; //                   
  create FUNCTION  is_number() returns boolean begin return false; end; //                   
  create FUNCTION  is_parent() returns boolean begin return false; end; //                   
  create FUNCTION  is_placeholder() returns boolean begin return false; end; //              
- -- create FUNCTION  get_so_signal() returns boolean begin return false; end; //
  create FUNCTION  get_signal() returns boolean begin return false; end; //               
  create FUNCTION  get_transactions_value() returns boolean begin return false; end; //      
  create FUNCTION  is_used() returns boolean begin return false; end; //                     
@@ -289,9 +286,9 @@ where
  create PROCEDURE  report_anomalies() begin end; //                                         
  create PROCEDURE  report_asset_allocation() begin end; //                                  
  create PROCEDURE  report_remaining_isa_allowance() begin end; //                           
- create PROCEDURE  reschedule() begin end; //                                               
+ create PROCEDURE  reschedule() begin end; //            
+ create PROCEDURE  run_schedule() begin end; //                                        
  create PROCEDURE  write_report() begin end; // 
-
 
 -- [A] REQUIRED CUSTOM TABLES AND TRIGGERS TO THOSE TABLES
 
@@ -426,7 +423,8 @@ procedure_block : begin
 	then
 
 		-- propogate a new price for the appropriate gnucash commodity
-		if lower(new.field) in ('last', 'price')
+		if 	lower(new.field) in ('last', 'price')
+		and	get_commodity_price(new.commodity_guid, new.value_date) != convert(new.value, decimal(15,5))
 		then
 			do post_commodity_price(	
 					new.commodity_guid,
@@ -440,7 +438,6 @@ procedure_block : begin
 					convert(new.value, decimal(20,6)),
 					ifnull(get_commodity_attribute(new.commodity_guid, 'method', new.value_date), 'Finance::Quote')
 				);
-
 		end if;
 
 		-- propogate a new dividend into the appropriate gnucash account
@@ -1125,7 +1122,7 @@ procedure_block:begin
 	declare l_gnucash_db_unlock_required 		boolean default false;
 	declare	l_error					varchar(1000);
 
-	call log( concat('DEBUG : START gnc_unlock(', ifnull(p_locks, 'null'), ')' ));
+	-- call log( concat('DEBUG : START gnc_unlock(', ifnull(p_locks, 'null'), ')' ));
 	
 	-- initialise (remove dupes from list, lock gnucash db by default)
 	set p_locks = ifnull( sort_array(p_locks, 'u', ','), get_variable('Gnucash schema') );
@@ -1173,7 +1170,7 @@ procedure_block:begin
 
 	end while;
 
-	call log('DEBUG : END gnc_unlock');
+	-- call log('DEBUG : END gnc_unlock');
 end;
 //
 set @procedure_count = ifnull(@procedure_count,0) + 1;
@@ -1200,7 +1197,7 @@ begin
 	declare l_lock_count				tinyint default 0;
 	declare	l_error					varchar(1000);
 
-	call log( concat('DEBUG : START gnc_lock(', ifnull(p_locks, 'null'), ')' ));
+	-- call log( concat('DEBUG : START gnc_lock(', ifnull(p_locks, 'null'), ')' ));
 
 	-- initialise (remove dupes from list, lock gnucash db by default)
 	set p_locks = ifnull( sort_array(p_locks, 'u', ','), get_variable('Gnucash schema') );
@@ -1326,7 +1323,7 @@ begin
 		return false;
 	end if;
 
-	call log('DEBUG : END gnc_lock');
+	-- call log('DEBUG : END gnc_lock');
 
 	-- if youve got this far, return true signal
 	return true;
@@ -1623,6 +1620,86 @@ end;
 set @procedure_count = ifnull(@procedure_count,0) + 1;
 //
 
+-- [R] Gnucash has this ragbag-of-stuff table called slots for which there is no documentation
+-- always returns varchar (even if actually a number) because actual datatype returned is undefined
+drop function if exists get_slot;
+//
+create function get_slot
+	(
+		p_guid  varchar(32),
+		p_name	varchar(4096)
+	)
+	returns varchar(4096)
+begin
+	declare l_slot_type		int(11);
+	declare l_int64_val		bigint(20);
+	declare	l_string_val		varchar(4096);
+	declare	l_double_val		double;
+	declare	l_timespec_val		timestamp;
+	declare	l_guid_val		varchar(32);
+	declare	l_numeric_val		decimal(20,6);
+	declare	l_gdate_val		date;
+
+	-- sanity check inputs
+	if 	p_guid is null
+		or p_name is null
+	then
+		return null;
+	end if;
+	
+	select
+		slot_type,
+		int64_val,
+		string_val,
+		double_val,
+		timespec_val,
+		guid_val,
+		numeric_val_num / ifnull(numeric_val_denom,1),
+		gdate_val
+	into	
+		l_slot_type,
+		l_int64_val,
+		l_string_val,
+		l_double_val,
+		l_timespec_val,
+		l_guid_val,
+		l_numeric_val,
+		l_gdate_val
+	from
+		slots
+	where
+		obj_guid = p_guid
+		and name = p_name;
+
+	-- it would be ideal to know what slot_types mean
+	case
+		-- known slot_types
+		when l_slot_type 	in (5,9)	then return l_guid_val;
+		when l_slot_type 	= 3		then return convert(l_numeric_val, char);
+		when l_slot_type 	= 4		then return l_string_val; 
+		when l_slot_type 	= 10		then return convert(l_gdate_val, char);
+
+		-- unknown slot_type : these fields are null when not in use
+		when l_timespec_val 	is not null 	then return convert(l_timespec_val, char);
+
+		-- unknown slot_type : these fields are 0 when not in use (or if they are really zero!)
+		else
+			if l_int64_val 		!= 0 	then 
+				return convert(l_int64_val, char);
+			elseif l_double_val 	!= 0 	then 
+				return convert(l_double_val, char);
+			else
+				-- value cant be any of those defined by slot_type, or null-when-unused, so it must be int64_val or double_val, hence zero
+				return '0';
+			end if;
+	end case;
+
+	return l_out;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
 -- [C] REPORTING ROUTINES
 
 -- returns pluralised form of p_text if p_number is not 1, ready for use in reports
@@ -1635,6 +1712,7 @@ create function pluralise
 		p_text		varchar(50)
 	)
 	returns varchar(50)
+	deterministic
 	no sql
 begin
 	declare l_out varchar(50);
@@ -1643,7 +1721,7 @@ begin
 	set p_text = trim(trailing 's' from p_text);
 
 	if p_number != 1 then
-		set l_out = concat(trim( trailing '.' from trim( both '0' from convert(p_number, char))), ' ', p_text, 's');
+		set l_out = concat(trim( trailing '.' from trim( trailing '0' from convert(p_number, char))), ' ', p_text, 's');
 	else
 		set l_out = concat('one ', p_text);
 	end if;
@@ -1663,6 +1741,7 @@ create function prettify
 		p_value		decimal(20,6)
 	)
 	returns varchar(1000)
+	deterministic
 	no sql
 begin
 	declare l_value varchar(1000);
@@ -1787,9 +1866,9 @@ set @procedure_count = ifnull(@procedure_count,0) + 1;
 //
 
 -- extracts reports from variables table 
--- designed to be called by a linux function 
+-- designed to be called by a commandline or scripted OS (eg linux) function 
 -- returns text of p_num (usually 1) reports, then deletes said report from variables table so its not extracted again
--- consequently, it needs to be called from the Linux scheduler regularly (at least once an hour) in order to work through any queue
+-- consequently, it needs to be called from the OS scheduler regularly (at least once an hour) in order to work through any queue
 -- if p_num >1 then >1 reports will be emitted in one lump of text
 drop procedure if exists get_report;
 //
@@ -3149,198 +3228,6 @@ end;
 set @procedure_count = ifnull(@procedure_count,0) + 1;
 //
 
--- returns a buy or sell signal based on MACD or PPO
--- *highly* experimental!!!
--- NOT TO BE USED TO MAKE BUY OR SELL DECISIONS!
-/*
-drop function if exists get_ppo_signal;
-//
-create function get_ppo_signal
-	(
-		p_guid			varchar(32), 	-- commodity_guid
-		p_date			timestamp 	-- date to look for
-	)
-	returns 			text
-begin
-	declare l_ppo_line 		decimal(6,3);
-	declare l_ppo_signal_line	decimal(6,3);
-	declare l_ppo_histogram		decimal(6,3);
-	declare l_date			timestamp;
-	declare l_report 		text;
-
-	declare l_short_ema_days	tinyint;
-	declare l_long_ema_days		tinyint;
-	declare l_signal_days	tinyint;
-	-- declare l_sample_days	tinyint;
-	-- declare l_days_back		tinyint;
-	declare l_gradient_sensitivity	decimal(2,1);
-
-	declare l_ppo_line_gradient		decimal(4,3);
-	declare l_ppo_histogram_gradient	decimal(4,3);
-	-- declare l_crossover_signal		varchar(50);
-	declare l_signal			varchar(100) default ' ';
-	declare l_previous_ppo_line 		decimal(6,3) default null;
-	declare l_previous_ppo_histogram	decimal(6,3) default null;
-
-	call log( concat('DEBUG : START get_ppo_signal(', ifnull(p_guid, 'null'), ',', ifnull(p_date, 'null'), ')'));
-
-	if 	not exists_commodity(p_guid) 
-		or p_guid = get_default_currency_guid()	
-	then
-		-- call log('DEBUG : leave');
-		return l_signal;
-	end if;
-
-	-- set defaults and initialise
-	set l_short_ema_days = ifnull(get_variable('Short EMA days'), 12);
-	set l_long_ema_days = ifnull(get_variable('Long EMA days'), 26);
-	set l_signal_days = ifnull(get_variable('Signal days'), 9);
-	-- set l_sample_days = ifnull(get_variable('Sample days'), 3);
-	-- set l_days_back = ifnull(get_variable('Days back'), 3);
-	set l_gradient_sensitivity = ifnull(get_variable('Gradient sensitivity'), 0.01);
-
-	set p_date = round_timestamp(ifnull(p_date, date_add(current_timestamp, interval -1 day) )); -- default to yesterday's price
-	set l_date = round_timestamp(date_add(p_date, interval - ifnull(get_variable('Days back'), 3) day));
-
-	-- calculate PPO for the last "get_variable('Days back')" days
-	repeat
-
-		call get_commodity_ppo(	
-						p_guid, 
-						l_date,
-						-- l_short_ema_days, 
-						-- l_long_ema_days,
-						-- l_signal_days,
-						l_ppo_line,
-						l_ppo_signal_line,
-						l_ppo_histogram
-					);
-
-	
-		if 	l_previous_ppo_line is not null
-			and l_previous_ppo_histogram is not null
-		then
-
-			set l_ppo_line_gradient = l_ppo_line - l_previous_ppo_line;
-			set l_ppo_histogram_gradient = l_ppo_histogram - l_previous_ppo_histogram;
-
-			-- V EARLY : divergences
-			-- if l_ppo_histogram has been decreasing for 4 days
-			-- and l_ppo_signal_line is -ve : BUY
-			-- and l_ppo_signal_line is +ve : SELL
-
-			if 	get_commodity_attribute(	p_guid,  
-								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
-								date_add(l_date, interval - 3 day)
-							)
-				>
-				get_commodity_attribute(	p_guid,  
-								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
-								date_add(l_date, interval - 2 day)
-							)
-				>
-				get_commodity_attribute(	p_guid,  
-								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
-								date_add(l_date, interval - 1 day)
-							)
-				>
-				get_commodity_attribute(	p_guid,  
-								concat('ppo_histogram(', l_short_ema_days, ',', l_long_ema_days,',', l_signal_days,')'), 
-								l_date
-							)
-			then
-				set l_signal = concat(	date_format(l_date, '%Y-%m-%d'),
-							'|',
-							'V early ',
-							if( l_ppo_signal_line < 0,
-								'buy',
-								'sell'
-							)
-						);
-			end if;
-
-			-- EARLY : ppo_line zero crossover
-			-- ppo_line has crossed zero line
-
-			-- try to avoid emitting crossover signals in a ranging market
-			if 	l_ppo_line_gradient is not null
-				and abs(l_ppo_line_gradient) >= l_gradient_sensitivity
-				and (
-					(	l_ppo_line > 0
-						and l_previous_ppo_line	<= 0
-					)
-					or
-					(
-						l_ppo_line < 0
-						and l_previous_ppo_line >= 0
-					)
-				)
-			then
-				set l_signal = concat(	date_format(l_date, '%Y-%m-%d'),
-							'|',
-							'Early ',
-							if( l_ppo_line_gradient > 0,
-								'buy',
-								'sell'
-							)
-						);
-			end if;
-
-			-- LATE : ppo_line signal line crossover
-			-- ppo_line has crossed signal line
-
-			-- try to avoid emitting crossover signals in a ranging market
-			if 	l_ppo_histogram_gradient is not null
-				and abs(l_ppo_histogram_gradient ) >= l_gradient_sensitivity
-				and (
-					(
-						l_ppo_histogram > 0
-						and l_previous_ppo_histogram <= 0	
-					) 
-					or 
-					(
-						l_ppo_histogram < 0
-						and l_previous_ppo_histogram >= 0
-					)
-				)
-			then
-				
-				set l_signal = concat(	date_format(l_date, '%Y-%m-%d'),
-							'|',
-							'Late ',
-							if( l_ppo_line_gradient > 0,
-								'buy',
-								'sell'
-							)
-						);	
-			end if;
-		end if;
-
-		-- set for next day
-		set l_date = round_timestamp(date_add(l_date, interval 1 day));
-		set l_previous_ppo_line = l_ppo_line;
-		set l_previous_ppo_histogram = l_ppo_histogram;
-
-	until l_date > p_date
-	end repeat;
-
-	if l_signal is not null
-	then
-		call write_report(	l_report,
-					concat(	'PPO |', l_signal ),
-					'table-middle'
-				);
-	end if;
-
-	call log('DEBUG : END get_ppo_signal');
-
-	return concat( l_report);
-end;
-//
-set @function_count = ifnull(@function_count,0) + 1;
-//
-*/
-
 -- [R] returns the SO (stochastic oscillator) of a commodity
 drop procedure if exists get_commodity_so;
 //
@@ -3541,111 +3428,6 @@ end;
 set @procedure_count = ifnull(@procedure_count,0) + 1;
 //
 
--- returns an overbought/oversold signal based on SO
--- *highly* experimental!!!
--- NOT TO BE USED TO MAKE BUY OR SELL DECISIONS!
-/*
-drop function if exists get_so_signal;
-//
-create function get_so_signal
-	(
-		p_guid			varchar(32),
-		p_date			timestamp
-	)
-	returns 			text
-begin
-	declare l_fast_so_line 		decimal(6,3);
-	declare l_slow_so_line		decimal(6,3);
-	declare l_signal_line		decimal(6,3);
-	-- declare l_period		tinyint;
-	-- declare l_days_back		tinyint;
-	declare l_ltso_signal		varchar(100) default null;
-	declare l_stso_signal		varchar(100) default null;
-	declare l_date			timestamp;
-	declare l_report 		text;
-
-	call log( concat('DEBUG : START get_so_signal(', ifnull(p_guid, 'null'), ',', ifnull(p_date, 'null'), ')'));
-
-	if 	not exists_commodity(p_guid) 
-		or p_guid = get_default_currency_guid()	
-	then
-		return l_signal;
-	end if;
-
-	set p_date = round_timestamp(ifnull(p_date, date_add(current_timestamp, interval -1 day) )); -- default to yesterday's price
-	-- set l_period = ifnull(get_variable('Stochastic oscillator period'), 14); -- by default, use 14-day SO
-	-- set l_days_back = ifnull(get_variable('Days back'), 3);
-	set l_date = round_timestamp(date_add(p_date, interval - ifnull(get_variable('Days back'), 3) day));
-
-	-- calculate PPO for the last p_days days and put them into a series of arrays (earliest first)
-	repeat
-
-		call get_commodity_so(	
-					p_guid, 
-					l_date,
-					-- l_period,
-					l_fast_so_line, 
-					l_slow_so_line, 
-					l_signal_line
-				);
-
-		-- (long term) oversold / overbought indicator
-		case
-			when l_slow_so_line < 10 then set l_ltso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Very oversold');
-			when l_slow_so_line < 20 then set l_ltso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Oversold');
-			when l_slow_so_line < 30 then set l_ltso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Mildly oversold');
-			when l_slow_so_line > 90 then set l_ltso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Very overbought');
-			when l_slow_so_line > 80 then set l_ltso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Overbought');
-			when l_slow_so_line > 70 then set l_ltso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Mildly overbought');
-			else begin end;		
-		end case;		
-
-		-- (short term) oversold / overbought indicator
-		case
-			when l_fast_so_line < 10 then set l_stso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Very oversold');
-			when l_fast_so_line < 20 then set l_stso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Oversold');
-			when l_fast_so_line < 30 then set l_stso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Mildly oversold');
-			when l_fast_so_line > 90 then set l_stso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Very overbought');
-			when l_fast_so_line > 80 then set l_stso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Overbought');
-			when l_fast_so_line > 70 then set l_stso_signal = concat(date_format(l_date, '%Y-%m-%d'),'| Mildly overbought');
-			else begin end;		
-		end case;
-
-		-- bull/bear divergences
-		-- todo
-
-		-- bull/bear setups
-		-- todo
-
-		set l_date = date_add(l_date, interval 1 day);
-
-	until l_date > p_date
-	end repeat;
-
-	if l_ltso_signal is not null
-	then
-		call write_report(	l_report,
-					concat(	'Long term SO |', l_ltso_signal ),
-					'table-middle'
-				);
-	end if;
-
-	if l_stso_signal is not null
-	then
-		call write_report(	l_report,
-					concat(	'Short term SO |', l_stso_signal ),
-					'table-middle'
-				);
-	end if;	
-
-	call log('DEBUG : END get_so_signal');
-
-	return l_report;
-end;
-//
-set @function_count = ifnull(@function_count,0) + 1;
-//
-*/
 
 -- [R] 
 -- Uses percentage price osciallator (PPO), stochastic osciallator (SO) and price extremes to make a buy or sell recommendation, based on your preset target allocations
@@ -3655,9 +3437,10 @@ drop function if exists get_signal;
 //
 create function get_signal
 	(
-		p_guid		varchar(32), -- commodity being watched
-		p_unit_change	decimal(20,6), -- -ve number means sell, +ve : buy (absolute value is irrelevant)
-		p_date		timestamp
+		p_guid			varchar(32), -- commodity being watched
+		p_unit_change		decimal(20,6), -- -ve number means sell, +ve : buy (absolute value is irrelevant)
+		p_predicted_gain	decimal(20,6), -- +ve, -ve or zero; used to filter out loss making SELL signals (absolute value is irrelevant)
+		p_date			timestamp
 	)
 	returns 	text
 begin
@@ -3666,7 +3449,11 @@ begin
 	declare l_conclusion		varchar(100); 
 	declare l_date			timestamp;
 	declare l_vote			decimal(6,3);
+	declare l_max_vote  		decimal(6,3);
+	declare l_strong_vote 		decimal(6,3);
+	declare l_mild_vote 		decimal(6,3);
 	declare l_observation 		varchar(100);
+	declare l_days_back		tinyint;
 
 	-- SO variables
 	declare l_fast_so_line 		decimal(6,3);
@@ -3701,7 +3488,11 @@ begin
 
 	-- set defaults and initialise
 	set p_date = round_timestamp(ifnull(p_date, date_add(current_timestamp, interval -1 day) ));
-	set l_date = round_timestamp(date_add(p_date, interval - ifnull(get_variable('Days back'), 3) day));
+	set l_days_back = if( ifnull( abs(get_variable('Days back') ),0 ) = 0, 1, abs(get_variable('Days back') ) );
+	set l_date = round_timestamp( date_add( p_date, interval - l_days_back day) );
+	if weekday(l_date) > 4 then -- if start date is a weekend (weekday = 5,6), go back to include previous friday
+		set l_date = date_add(l_date, interval - (weekday(l_date) - 4) day);
+	end if;	 
 	set l_short_ema_days = ifnull(get_variable('Short EMA days'), 12);
 	set l_long_ema_days = ifnull(get_variable('Long EMA days'), 26);
 	set l_signal_days = ifnull(get_variable('Signal days'), 9);
@@ -3951,26 +3742,28 @@ begin
 			set l_vote = - ifnull(get_variable('Vote cap'),5);
 		end if;
 			
-		if 	l_days_since_high < 56 then
-			set l_observation = concat( pluralise( round(l_days_since_high / 7, 0), 'week' ), ' since price was this high');
-		elseif l_days_since_high < 365 then
-			set l_observation = concat( pluralise( round(l_days_since_high / 31, 0) , 'month'), ' since price was this high');
+		if 	l_days_since_high <= 13 then
+			set l_observation = concat( pluralise( round(l_days_since_high,0), 'day' ), ' since price was this high');
+		elseif 	l_days_since_high <= 55 then
+			set l_observation = concat( pluralise( round(l_days_since_high / 7,0), 'week' ), ' since price was this high');
+		elseif l_days_since_high <= 364 then
+			set l_observation = concat( pluralise( round(l_days_since_high / 31,0), 'month'), ' since price was this high');
 		else
-			set l_observation = concat( pluralise( round(l_days_since_high / 365.25, 1) ,'year'), ' since price was this high');
+			set l_observation = concat( pluralise( round(l_days_since_high / 365.25, 1), 'year'), ' since price was this high');
 		end if;
-	end if;
 
-	if ifnull(l_vote,0) != 0 
-	then
-		replace into poll
-			(metric, metric_date, observation, vote)
-		values
-			(
-				'Extreme high', 
-				p_date,
-				l_observation,
-				round(l_vote * ifnull(get_variable('Extremes weighting'),1),0)
-			);
+		if ifnull(l_vote,0) != 0 
+		then
+			replace into poll
+				(metric, metric_date, observation, vote)
+			values
+				(
+					'Extreme high', 
+					p_date,
+					l_observation,
+					round(l_vote * ifnull(get_variable('Extremes weighting'),1),0)
+				);
+		end if;
 	end if;
 
 	if ifnull(l_days_since_low,0) > ifnull(get_variable('Ignore extremes'),7) then
@@ -3980,56 +3773,78 @@ begin
 			set l_vote = ifnull(get_variable('Vote cap'),5);
 		end if;
 			
-		if 	l_days_since_high < 56 then
-			set l_observation = concat( pluralise( round(l_days_since_high / 7, 0), 'week' ), ' since price was this low');
-		elseif l_days_since_high < 365 then
-			set l_observation = concat( pluralise( round(l_days_since_high / 31, 0) , 'month'), ' since price was this low');
+		if 	l_days_since_low <= 13 then
+			set l_observation = concat( pluralise( round(l_days_since_low,0) , 'day' ), ' since price was this low');
+		elseif 	l_days_since_low <= 55 then
+			set l_observation = concat( pluralise( round(l_days_since_low / 7,0), 'week' ), ' since price was this low');
+		elseif l_days_since_low <= 364 then
+			set l_observation = concat( pluralise( round(l_days_since_low / 31,0), 'month'), ' since price was this low');
 		else
-			set l_observation = concat( pluralise( round(l_days_since_high / 365.25, 1) ,'year'), ' since price was this low');
+			set l_observation = concat( pluralise( round(l_days_since_low / 365.25, 1), 'year'), ' since price was this low');
 		end if;
-	end if;
 
 	-- call log( concat('DEBUG : [extremes] l_vote = ', ifnull(l_vote, 'null')));
 	-- call log( concat('DEBUG : [extremes] l_observation = ', ifnull(l_observation, 'null')));
 
-	if ifnull(l_vote,0) != 0 
-	then
-		replace into poll
-			(metric, metric_date, observation, vote)
-		values
-			(
-				'Extreme low', 
-				p_date,
-				l_observation,
-				round(l_vote * ifnull(get_variable('Extremes weighting'),1),0)
-			);
+		if ifnull(l_vote,0) != 0 
+		then
+			replace into poll
+				(metric, metric_date, observation, vote)
+			values
+				(
+					'Extreme low', 
+					p_date,
+					l_observation,
+					round(l_vote * ifnull(get_variable('Extremes weighting'),1),0)
+				);
+		end if;
 	end if;
 
 	-- [END] Extremes analysis
 
 	-- Calculate BUY/SELL conclusion with more weight given to later signals; majority wins
-	select 	sum( vote / if( datediff(p_date, metric_date) <= 1, 1, ( datediff(p_date, metric_date)/2 ) ) )
+	-- full weight is given to signals from today and the previous work day (which might be yesterday or Friday)
+	select 	sum( vote / 	if( 	datediff(p_date, metric_date) <= 1
+					or weekday(p_date) = 0 and datediff(p_date, metric_date) <= 3, 
+					1, 
+					(datediff(p_date, metric_date)/2) -- /2 to make tail-off slightly less aggressive 
+				) 
+		)
 	into 	l_vote
 	from 	poll;
 
 	-- call log( concat('DEBUG : l_vote = ', ifnull(l_vote, 'null')));
 
+	-- dynamically set strong/mild/weak boundaries
+	set l_max_vote = 	3 * ifnull(get_variable('Percentage price oscillator weighting'),1) + 
+				3 * ifnull(get_variable('Short term stochastic oscillator weighting'),1) +
+				ifnull(get_variable('Vote cap'),5) * ifnull(get_variable('Extremes weighting'),1);
+
+	set l_strong_vote = (2 * l_max_vote)/3;
+	set l_mild_vote = l_max_vote/3;
+
+	-- log a warning if the weak vote filter is set too high
+	if ifnull(get_variable('Filter weak signals'), '1') > l_max_vote
+	then
+		call log( concat('WARNING : Variable ''Filter weak signals'' may be set too high. Recommended setting : ', round(l_mild_vote,0) ));	
+	end if;
+
 	-- filter out weak signals if requested
-	if 	abs(l_vote) > ifnull(get_variable('Filter weak signals'), '0') 
+	if 	abs(l_vote) > ifnull(get_variable('Filter weak signals'), '1') 
 	then
 
 		-- convert votes to text
-		if abs(l_vote) > ifnull(get_variable('Very strong vote'),5) then
+		if abs(l_vote) > l_max_vote then
 			set l_conclusion = 'VERY STRONG';
-		elseif abs(l_vote) > ifnull(get_variable('Strong vote'),3) then
+		elseif abs(l_vote) > l_strong_vote then
 			set l_conclusion = 'STRONG';
-		elseif abs(l_vote) > ifnull(get_variable('Mild vote'),1) then
-			set l_conclusion = '';
-		elseif abs(l_vote) > ifnull(get_variable('Weak vote'),0) then
+		elseif abs(l_vote) > l_mild_vote then
+			set l_conclusion = 'MILD';
+		else
 			set l_conclusion = 'WEAK';
 		end if;
 
-		if p_unit_change < 0 and l_vote < 0 then
+		if p_unit_change < 0 and p_predicted_gain >= 0 and l_vote < 0 then
 			set l_conclusion = concat('<font color=blue><b>', l_conclusion, ' SELL</b></font>');
 		elseif p_unit_change > 0 and l_vote > 0 then
 			set l_conclusion = concat('<font color=green><b>', l_conclusion, ' BUY</b></font>');
@@ -4049,7 +3864,7 @@ begin
 
 				declare lc_poll cursor for
 					select distinct
-						concat (date_format(metric_date, '%Y-%m-%d'), '|',
+						concat (date_format(metric_date, '%d %b'), '|',
 							metric, '|',
 							observation
 						)
@@ -4080,12 +3895,9 @@ begin
 				close lc_poll;
 
 			end; -- report_block
-		
-		
-			-- set l_report = 
-
+				
 			call write_report(	l_verbose_report,
-			 			'Metric|Date|Observation',
+			 			'Date|Metric|Observation',
 			 			'table-start');
 
 			call write_report(	l_verbose_report,
@@ -4170,7 +3982,7 @@ begin
 		set l_26_day_sma 	= get_commodity_sma(p_commodity, 26, l_previous_date);
 
 		-- gnc-fq-dump (or yahoo) has the occasional tendency to report GBP/GBp prices a factor of 100 out
-		-- (it also tends to occasionally lie about the currency the quote is in)
+		-- (it can also lie about the currency the quote is in)
 		if 	l_26_day_sma is not null
 			and abs(p_value - l_26_day_sma) / l_26_day_sma >= 0.95 
 		then
@@ -4200,13 +4012,75 @@ begin
 		-- 	set l_is_sane = if(abs(p_value - l_previous_price) / l_previous_price <= (get_variable('New quote filter')/100), true, false);
 		-- end if;
 
-		-- if values appear sane, then insert them
-		if	not exists_price(p_commodity, p_date)
+		-- insert price values of they appear sane
+		case
+
+			when 	exists_price(p_commodity, p_date) 
+			then
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because a price already exists for ', date_format(p_date, "%Y-%m-%d"), '.' ));
+			
+			when 	l_previous_currency != p_currency
+			then
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the currencies dont match.' ));
+
+			when 	l_previous_price is not null
+				and p_value = l_previous_price 
+			then
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the new value is the same as the previous one.' ));
+
+			when 	l_26_day_sma is not null
+				and abs(p_value - l_26_day_sma) / l_26_day_sma > (get_variable('New quote filter')/100) 
+			then
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the new value is >', get_variable('New quote filter'), '% different from the 26 day SMA (',l_26_day_sma, ').'  ));
+
+			when 	l_26_day_sma is null
+				and l_previous_price is not null
+				and abs(p_value - l_previous_price) / l_previous_price > (get_variable('New quote filter')/100) 
+			then
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the new value is >', get_variable('New quote filter'), '% different from the previous price (',l_previous_price, ').'  ));
+
+			else
+
+				if gnc_lock('prices') then
+
+					set l_guid = new_guid();
+
+					insert into prices (
+						guid, 
+						commodity_guid, 
+						currency_guid, 
+						date, 
+						source,
+						type, 
+						value_num, 
+						value_denom
+					)
+					values (
+						l_guid,
+						p_commodity,
+						ifnull(get_commodity_currency(p_commodity), get_commodity_guid(trim(p_currency))),
+						p_date,
+						ifnull(p_source, 'Finance::Quote'),
+						'last',
+						p_value * ifnull(l_previous_denom, 1000000),	-- quotes for previously unquoted commodities have no denom, so assume max for decimal(20,6) type
+						ifnull(l_previous_denom, 1000000)		
+					);
+
+					call gnc_unlock('prices');
+
+					-- log action
+					call log( concat('INFORMATION : Inserted new price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity) ));			
+
+				end if;
+
+		end case;
+
+/*		if	not exists_price(p_commodity, p_date)
 			and (
 				l_previous_price is null -- first quote
 				or (
 					l_previous_currency = p_currency
-					and p_value != l_previous_price	 -- not the first quote
+					and p_value != l_previous_price	
 					and if(	l_26_day_sma is not null,
 						if(abs(p_value - l_26_day_sma) 		/ l_26_day_sma 		<= (get_variable('New quote filter')/100), true, false),
 						if(abs(p_value - l_previous_price) 	/ l_previous_price 	<= (get_variable('New quote filter')/100), true, false)
@@ -4236,46 +4110,44 @@ begin
 					p_date,
 					ifnull(p_source, 'Finance::Quote'),
 					'last',
-					p_value * ifnull(l_previous_denom, 1000000),	-- quotes for previously unquoted commodities have no denom, so assume max for decimal(20,6) type
+					p_value * ifnull(l_previous_denom, 1000000),
 					ifnull(l_previous_denom, 1000000)		
 				);
 
 				call gnc_unlock('prices');
 
-				-- nix any dependent attributes
-				-- call delete_derived_commodity_attributes(p_commodity, p_date); -- performing this here can cause a trigger blizzard
-
-				-- log action
 				call log( concat('INFORMATION : Inserted new price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity) ));			
 
 			end if;
 
 		else
 
-			-- log the reason a quote was not loaded
 			case
 
 			when exists_price(p_commodity, p_date) then
-				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' NOT inserted because a price already exists for ', date_format(p_date, "%Y-%m-%d"), '.' ));
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because a price already exists for ', date_format(p_date, "%Y-%m-%d"), '.' ));
 
 			when p_value = l_previous_price then
-				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' NOT inserted because the new value is the same as the most recent one.' ));
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the new value is the same as the previous one.' ));
 
 			when l_previous_currency != p_currency then
-				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' NOT inserted because the currencies dont match.' ));
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the currencies dont match.' ));
 	
 			when abs(p_value - l_26_day_sma) / l_26_day_sma > (get_variable('New quote filter')/100) then
-				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' NOT inserted because the new value is >', get_variable('New quote filter'), '% different from the 26 day SMA (',l_26_day_sma, ').'  ));
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the new value is >', get_variable('New quote filter'), '% different from the 26 day SMA (',l_26_day_sma, ').'  ));
 
 			when l_26_day_sma is null then
-				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' NOT inserted because the 26 day SMA was null.' ));
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted because the 26 day SMA was null.' ));
 
 			else
-				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' NOT inserted for an unknown reason.' ));
+				call log( concat('WARNING : New price ' , get_commodity_mnemonic(p_currency) , ' ',  convert(p_value, char) , ' for ',  if( is_currency( p_commodity ) , 'currency ', 'commodity ') , get_commodity_mnemonic(p_commodity), ' not inserted for an unknown reason.' ));
 
 			end case;
 
 		end if;
+
+	end if;
+*/
 
 	end if;
 
@@ -4297,13 +4169,13 @@ create procedure clean_prices
 procedure_block : begin
 	declare l_guid				varchar(32);
 	declare l_commodity_guid		varchar(32);
-	declare l_previous_commodity_guid	varchar(32);
+	-- declare l_previous_commodity_guid	varchar(32);
 	declare l_currency_guid			varchar(32);
 	declare l_date				timestamp;
-	declare l_previous_date			timestamp;
+	-- declare l_previous_date		timestamp;
 	declare l_value				decimal(20,6);
-	declare l_30_day_sma			decimal(20,6);
-	declare l_field				varchar(100);
+	-- declare l_30_day_sma			decimal(20,6);
+	-- declare l_field			varchar(100);
 	declare l_source			varchar(2048);
 	declare l_type				varchar(2048);
 	declare	l_count_before 			integer default 0;
@@ -4312,7 +4184,7 @@ procedure_block : begin
 	declare l_duplicate_price_done_temp 	boolean default false;
 	declare l_missing_price_done 		boolean default false;
 	declare l_missing_price_done_temp 	boolean default false;
-	declare l_earliest_date			timestamp default current_timestamp;
+	-- declare l_earliest_date		timestamp default current_timestamp;
 
 	-- declare l_x_100_done 		boolean default false;
 	-- declare l_x_100_done_temp 		boolean default false;
@@ -4331,19 +4203,25 @@ procedure_block : begin
 		set p_guid = get_commodity_guid(p_guid);
 	end if;
 
-	-- add prices that are in commodity_attributes but missing from prices (within the last month)
+	-- add prices that are in commodity_attributes but missing from prices (within the last get_variable('Price check') days)
 	missing_prices : begin
 		declare lc_missing_price cursor for
 			select distinct 
 				commodity_attribute.commodity_guid,
-				commodity_attribute.value_date,
-				trim(commodity_attribute.value),
-				commodity_attribute.field
+				round_timestamp(commodity_attribute.value_date),
+				trim(commodity_attribute.value)
+				-- commodity_attribute.field
 			from	commodity_attribute
-			where 	commodity_attribute.field in ('last', 'price')
+			where 	-- the value is a price
+				commodity_attribute.field in ('last', 'price')
+				-- the value is a number
 				and is_number(commodity_attribute.value)
+				-- the values date is between get_variable('Price check') days ago and now
 				and commodity_attribute.value_date <= current_date
-				and commodity_attribute.value_date >= date_add(current_date, interval - get_variable('Price check') day)
+				and commodity_attribute.value_date >= date_add(current_date, interval - ifnull(get_variable('Price check'),30) day)
+				-- the value is not the same as the previous days
+				and commodity_attribute.value != get_commodity_price( commodity_attribute.commodity_guid, date_add(commodity_attribute.value_date, interval - 1 day))
+				-- a value has not already been entered for that day
 				and not exists_price(commodity_attribute.commodity_guid, commodity_attribute.value_date)
 				-- and commodity_attribute.value != get_commodity_price(commodity_attribute.commodity_guid, commodity_attribute.value_date)
 				and (p_guid is null or p_guid = commodity_attribute.commodity_guid)
@@ -4359,7 +4237,7 @@ procedure_block : begin
 		missing_price_loop : loop
 	
 			fetch lc_missing_price 
-			into l_commodity_guid, l_date, l_value, l_field;
+			into l_commodity_guid, l_date, l_value;
 		
 			if l_missing_price_done then 
 				leave missing_price_loop;
@@ -4367,35 +4245,23 @@ procedure_block : begin
 				set l_missing_price_done_temp = l_missing_price_done;
 			end if;	
 
-			-- dont bother to add a new price if that commodity/date combo has already been done
-			if	l_previous_commodity_guid is null
-				or l_previous_date is null
-				or l_commodity_guid != l_previous_commodity_guid
-				or (	l_commodity_guid = l_previous_commodity_guid
-						and l_date != l_previous_date )
-			then
-				do post_commodity_price(	
-						l_commodity_guid,
-						l_date,
-						if( 	is_currency(l_commodity_guid),
-							get_default_currency_guid(),
-							get_commodity_guid( get_commodity_attribute(l_commodity_guid, 'currency', l_date) )
-						),
-						l_value,
-						ifnull(get_commodity_attribute(l_commodity_guid, 'method', l_date), 'Finance::Quote')
-					);
+			do post_commodity_price(	
+					l_commodity_guid,
+					l_date,
+					if( 	is_currency(l_commodity_guid),
+						get_default_currency_guid(),
+						get_commodity_guid( get_commodity_attribute(l_commodity_guid, 'currency', l_date) )
+					),
+					l_value,
+					ifnull(get_commodity_attribute(l_commodity_guid, 'method', l_date), 'Finance::Quote')
+				);
 
-				-- nix any dependent attributes
-				if not is_locked('commodity_attribute', 'WAIT') then
-					call delete_derived_commodity_attributes(l_commodity_guid, l_date);
-				end if;
-
-				set l_count_after = l_count_after + 1;
-
+			-- nix any dependent attributes
+			if not is_locked('commodity_attribute', 'WAIT') then
+				call delete_derived_commodity_attributes(l_commodity_guid, l_date);
 			end if;
-		
-			set l_previous_commodity_guid = l_commodity_guid;
-			set l_previous_date = l_date;
+
+			set l_count_after = l_count_after + 1;
 			set l_missing_price_done = l_missing_price_done_temp;
 
 		end loop;
@@ -4852,7 +4718,7 @@ drop function if exists get_transactions_value;
 //
 create function get_transactions_value
 	(
-		p_guid1			varchar(32), -- CSV list of account guids
+		p_guid1			varchar(32), -- account guid
 		p_guid2			varchar(60000), -- CSV list of account guids
 		p_currency		varchar(32),
 		p_date1			timestamp,
@@ -4906,7 +4772,7 @@ begin
 	end if;
 
 	select
-				sum( transaction_set.value)
+			sum( transaction_set.value)
 	into		l_value
 	from
 	(
@@ -4917,7 +4783,7 @@ begin
 					transactions2.post_date
 				) as value
 		from
-					splits splits2
+				splits splits2
 			join	transactions transactions2
 				on	transactions2.guid = splits2.tx_guid	
 		where
@@ -5629,9 +5495,9 @@ create function get_account_children
 		p_guid 			varchar(32),
 		p_recursive		boolean
 	)
-	returns varchar(2048)
+	returns varchar(60000)
 begin
-	declare l_guid 			varchar(2048);
+	declare l_guid 			varchar(60000);
 	declare l_long_name		varchar(2048);
 
 	-- sanity check
@@ -6730,7 +6596,7 @@ begin
 	call log( concat('DEBUG : START post_gain(', ifnull(p_guid, 'null'), ')'));
 
 	-- try to play nicely with other procedures
-	do is_locked('transactions, splits', 'WAIT');
+	-- do is_locked('transactions, splits', 'WAIT');
 
 	-- calculate gains on STOCK or ASSET account types only
 	-- ? exclude accounts for which cap gains cannot be calced; accounts denominated in home currency (where there is no independent unit value)
@@ -7048,7 +6914,7 @@ begin
 	call log( concat('DEBUG : START post_dividend(', ifnull(p_guid, 'null'), ',', ifnull(p_value, 'null'), ',', ifnull(p_date, 'null'), ')' ));
 
 	-- try to play nicely with other procedures
-	do is_locked('transactions, splits', 'WAIT');
+	-- do is_locked('transactions, splits', 'WAIT');
 
 	set p_date = round_timestamp( ifnull(p_date, current_date) );
 	set l_dividend_payment_date = date_add(p_date, interval get_variable('Dividend payment date') day); -- dividends are usually paid 1-4 weeks after the date of the Yahoo finance record 
@@ -7749,8 +7615,8 @@ create procedure report_remaining_isa_allowance
 procedure_block:begin
 	declare	l_report 			text;
 	declare l_isa_contribution 		decimal(20,6) default 0;
-	declare l_cash_accounts 		varchar(65000);
-	declare l_ISA_accounts 			varchar(2048);
+	declare l_cash_accounts 		varchar(60000);
+	declare l_ISA_accounts 			varchar(60000);
 	declare l_tax_year_start 		timestamp;
 	declare l_tax_year_end 			timestamp;
 	declare l_cash_account_counter 		smallint default 1;
@@ -8731,58 +8597,12 @@ procedure_block : begin
 
 					-- call log('DEBUG : F');
 	
-					set l_alert_recommendation = get_signal(l_commodity_guid, l_target_unit_change, null);
+					set l_alert_recommendation = get_signal(l_commodity_guid, l_target_unit_change, l_predicted_gain, null);
 					
-/*					set l_so_signal = get_so_signal( l_commodity_guid, null);
-					set l_ppo_signal = get_ppo_signal( l_commodity_guid, null);
-
-					-- only return accounts that require immediate attention
-					if	l_target_unit_change < 0 then -- you need to SELL to meet target
-
-						-- call log('DEBUG : G');
-
-						if locate('sell', l_ppo_signal) != 0 then
-
-							-- call log('DEBUG : I');
-							set l_alert_recommendation = concat( ifnull(l_alert_recommendation, ''), l_ppo_signal);
-						end if;
-
-						if locate('bought', l_so_signal) != 0 then
-
-							-- call log('DEBUG : H');
-							set l_alert_recommendation = concat( ifnull(l_alert_recommendation, ''), l_so_signal);
-						end if;
-
-					elseif l_target_unit_change > 0 then -- you need to BUY to meet target
-
-						-- call log('DEBUG : J');
-
-						if locate('buy', l_ppo_signal) != 0 then
-
-							-- call log('DEBUG : L');
-							set l_alert_recommendation = concat( ifnull(l_alert_recommendation, ''), l_ppo_signal);
-						end if;
-
-						if locate('sold', l_so_signal) != 0 then
-
-							-- call log('DEBUG : K');
-							set l_alert_recommendation = concat( ifnull(l_alert_recommendation, ''), l_so_signal);
-						end if;
-
-					end if;					
-*/
 					-- writing report line for 'alert' types
 					if l_alert_recommendation is not null then
 
 						-- call log('DEBUG : M');
-
-						-- call write_report(	l_alert_recommendation,
-						-- 			'Metric|Date|Observation',
-						-- 			'table-start');
-
-						-- call write_report(	l_alert_recommendation,
-						-- 			null,
-						--			'table-end');
 
 						call write_report(	l_report,
 									concat(
@@ -9163,6 +8983,152 @@ end;
 set @procedure_count = ifnull(@procedure_count,0) + 1;
 //
 
+-- [RW] Runs Gnucash GUI schedule
+drop procedure if exists run_schedule;
+//
+create procedure run_schedule()
+procedure_block : begin
+
+	declare l_schedule_guid		varchar(32);
+	declare l_split_guid		varchar(32);
+	declare l_from_account		varchar(32); 
+	declare l_to_account		varchar(32); 
+	declare l_amount		decimal(20,6);
+	declare l_mult			int(11);
+	declare l_period_type		varchar(2048);
+	declare l_date			date; 
+	declare l_description		varchar(2048);
+	declare l_schedule_done_temp	boolean default false;
+	declare l_schedule_done		boolean default false;
+
+	declare lc_schedule cursor for
+		select distinct
+			schedxactions.guid,
+			if(length(trim(transactions.description)) != 0, transactions.description, schedxactions.name),
+			get_slot( get_slot(splits.guid, 'sched-xaction'), 'sched-xaction/account'),
+			to_account.account,
+			get_slot( get_slot(splits.guid, 'sched-xaction'), 'sched-xaction/credit-formula'),
+			recurrences.recurrence_mult,
+			recurrences.recurrence_period_type,
+			ifnull( schedxactions.last_occur, recurrences.recurrence_period_start )
+			
+		from schedxactions 
+			join splits 			on schedxactions.template_act_guid = splits.account_guid 
+			join transactions		on splits.tx_guid = transactions.guid
+			join recurrences 		on schedxactions.guid = recurrences.obj_guid 
+			join (
+				select distinct
+					schedxactions.guid as schedxactions_guid,
+					get_slot( get_slot(splits.guid, 'sched-xaction'), 'sched-xaction/account') as account
+				from schedxactions 
+					join splits on schedxactions.template_act_guid = splits.account_guid 
+				where
+					ifnull(get_slot( get_slot(splits.guid, 'sched-xaction'), 'sched-xaction/debit-formula'), 0) > 0
+				) to_account
+					on schedxactions.guid = to_account.schedxactions_guid
+		where 	schedxactions.enabled = 1 
+			and schedxactions.auto_create = 1 
+			and schedxactions.start_date <= now() 
+			and (schedxactions.end_date >= now() or schedxactions.end_date is NULL)
+            		and ifnull(get_slot( get_slot(splits.guid, 'sched-xaction'), 'sched-xaction/credit-formula'), 0) > 0;
+
+	declare continue handler for not found set l_schedule_done =  true;
+
+	call log('DEBUG : START run_schedule');
+
+	open lc_schedule;	
+	set l_schedule_done = false;
+	
+	-- work through each scheduled event
+	schedule_loop : loop
+		
+		fetch 	lc_schedule 
+		into 	l_schedule_guid,
+			l_description,
+			l_from_account, 
+			l_to_account, 
+			l_amount,
+			l_mult,
+			l_period_type,
+			l_date;
+	
+		if l_schedule_done then 
+			leave schedule_loop;
+		else
+			set l_schedule_done_temp = l_schedule_done;
+		end if;
+
+		repeat
+
+			-- get date of next scheduled transaction
+			set l_date =  case l_period_type
+						when 'year' 		then 
+							date_add( l_date, interval l_mult year )
+						when 'month' 		then 
+							date_add( l_date, interval l_mult month )
+						when 'week' 		then 
+							date_add( l_date, interval l_mult week )
+						when 'day' 		then 
+							date_add( l_date, interval l_mult day )
+						when 'end of month'	then 
+							last_day( l_date )
+					end;
+
+			if l_date <= sysdate() then
+
+				call log( concat('DEBUG : Scheduled transaction. From account=',
+					get_account_long_name(l_from_account), ', To account=',
+					get_account_long_name(l_to_account), ', Amount=',
+					convert(l_amount, char), ', Date=',
+					convert(l_date, char), ', Description=',
+					l_description
+				));
+
+				if 	upper(ifnull(get_variable('Run schedule'), 'FALSE')) = 'TRUE'
+					and gnc_lock('schedxactions')
+				then
+
+					-- insert transaction
+					set l_split_guid = post_split( 
+								l_from_account, 
+								l_to_account, 
+								l_amount, 
+								null, 
+								l_date, 
+								l_description
+							);
+
+					-- update schedule table
+					if l_split_guid is not null then
+
+						update 	schedxactions
+						set	last_occur = l_date,
+							instance_count = instance_count + 1
+						where	guid = l_schedule_guid;	
+		
+					end if;
+
+					call gnc_unlock('schedxactions');
+
+				end if;
+
+			end if;
+
+		until l_date > sysdate()
+		end repeat;
+
+		set l_schedule_done = l_schedule_done_temp;
+
+	end loop;
+
+	close lc_schedule;
+
+	call log('DEBUG : END run_schedule');
+end;
+//
+set @procedure_count = ifnull(@procedure_count,0) + 1;
+//
+
 -- Self-test routine
 -- under eternal construction
 drop procedure if exists customgnucash_status;
@@ -9362,7 +9328,7 @@ procedure_block : begin
 	end if;
 
 	-- Check gnucash database can be written to (non fatal error; just precludes CustomGnucash RW operations)
-	-- attempt twice on failure (test occasionally fails spuriously)
+	-- attempt a number of times on failure (test occasionally fails spuriously)
 	set l_count = 1;
 	repeat 
 		if 	get_variable('Gnucash status') = 'R'
@@ -9401,7 +9367,7 @@ procedure_block : begin
 				then
 					call put_variable('Gnucash status', 'RW');
 				else
-					if l_count >= 2 
+					if l_count >= 5 
 					then
 						call log( concat('WARNING : [', l_err_code, '] the GnuCash database "', get_variable('Gnucash schema'), '" could not be written to (',l_integer1, ',',l_integer2, ',', l_integer3, ')' ));
 					else
@@ -9414,7 +9380,7 @@ procedure_block : begin
 			end;
 
 		end if;
-	until get_variable('Gnucash status') = 'RW' or l_count >= 2
+	until get_variable('Gnucash status') = 'RW' or l_count >= 5
 	end repeat;
 
 	-- Test commodity attribute routines (needs access to gnucash db)
@@ -9576,8 +9542,8 @@ begin
 		-- calculate and post capital gains
 		call post_all_gains();
 
-		-- TODO run scheduled transactions
-		-- call run_schedule();
+		-- run scheduled transactions (if  get_variable('Run schedule') = 'true'; by default its 'false')
+		call run_schedule();
 
 	end if; 
 
@@ -9587,7 +9553,7 @@ end;
 set @event_count = ifnull(@event_count,0) + 1;
 //
 
--- Event to clean up customgnucash log table (default : keep last 30 days only)
+-- ragbag of maintenance functions
 drop event if exists monthly_housekeeping;
 //
 create event monthly_housekeeping
@@ -9611,7 +9577,7 @@ begin
 	-- only proceed when lock obtained
 	if get_variable('Customgnucash status') = 'OK' then 
 
-		-- clean up log table
+		-- clean up customgnucash log table (default : keep last 30 days only)
 		if gnc_lock('log') then
 			delete from log where datediff(current_timestamp, logdate) > get_variable('Keep log');
 			call gnc_unlock('log');
@@ -9635,10 +9601,10 @@ begin
 		) default_currency;
 		
 		if l_default_currency != get_variable('Default currency') then
-			call log( concat('WARNING : your most used currency is "', l_default_currency, '" not the default currency "', get_variable('Default currency'), '". To change it, run (in MySQL) : put_variable(''Default currency'',''', l_default_currency,''');'));
+			call log( concat('WARNING : your most used currency is "', l_default_currency, '" not the default currency "', get_variable('Default currency'), '". To change it, run (in MySQL) : call put_variable(''Default currency'',''', l_default_currency,''');'));
 		end if;
 
-		-- turn off quoting for commodities where a value has not been received for 'Stop quoting' months
+		-- turn off quoting for commodities where a value has not been received for 'Stop quoting' (default 6) months
 		if get_variable('Gnucash status') =  'RW' then
 
 			select 	group_concat( distinct get_commodity_mnemonic(commodities.guid ))
@@ -9942,16 +9908,18 @@ call post_variable('Signal days', '9');
 //
 -- call post_variable('Sample days', '3');
 -- //
-call post_variable('Days back', '7');
+call post_variable('Days back', '2');
 //
 call post_variable('Gradient sensitivity', '0.01');
 //
-
 -- percentage difference of a new quote wrt the previous quote above which that new quote will not be loaded (to filter out bad new price data)
 call post_variable ('New quote filter', '50'); 
 //
 -- seconds for which a table lock request will wait before giving up (see function gnc_lock )
 call post_variable('Lock wait', 60);
+//
+-- whether to run (or just log) procedure run_schedule that creates GnuCash transactions from the GUI schedule
+call post_variable ('Run schedule', 'false');
 //
 
 -- Dividends are usually paid 1-4 weeks after the date recorded (in Yahoo Finance historical dividend CSVs, for example). Assumed at 14 days; can be altered as required, but it could be different for each stock, so this value can only ever be an aggregated estimate
@@ -9998,14 +9966,10 @@ call post_variable('Ignore extremes', 14); -- ignore high/low-since-x-days signa
 //
 call post_variable('Vote cap', 5); -- cap buy/sell votes to avoid overwhelming other signals
 //
-call post_variable('Very strong vote', 5); -- votes above which a signal is considered strong
-//
-call post_variable('Strong vote',3);
-//
-call post_variable('Mild vote',1);
-//
-call post_variable('Weak vote',0);
-//
+-- call post_variable('Very strong vote', 6); -- votes above which a signal is considered very strong
+-- //
+-- call post_variable('Strong vote',4); -- botes above which are strong, by implication below which are weak
+-- //
 call post_variable('Extremes weighting',1); -- weight given to extremes price analysis
 //
 call post_variable('Short term stochastic oscillator weighting',1);
@@ -10014,7 +9978,7 @@ call post_variable('Long term stochastic oscillator weighting',2);
 //
 call post_variable('Percentage price oscillator weighting',2);
 //
-call post_variable('Filter weak signals',1); -- votes below which a report will not be sent
+call post_variable('Filter weak signals',4); -- votes below which a report will not be sent
 //
 
 -- Jurisdiction variables
