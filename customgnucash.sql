@@ -1,7 +1,7 @@
 /*
 GnuCash MySql routines
 Author : Adam Harrington
-Date : 5 July 2015
+Date : 13 July 2015
 */
 
 -- Customgnucash actions below are marked [R] if they require Readonly access to the gnucash database, [W] Writeonly and [RW] for both.
@@ -56,10 +56,12 @@ Date : 5 July 2015
 -- Optionally hard-code this script
 -- use customgnucash;
 
--- database flags
+-- database flags (may need super user privileges to run)
 -- set sql_mode=ansi;
 -- PIPES_AS_CONCAT ('something' || 'something else') it only used when create log messages; concat('something','something else') is more standard
 -- set sql_mode=PIPES_AS_CONCAT;
+-- set global group_concat_max_len=60000; -- required to allow group_concat to list up to 800 accopunt guids
+
 
 -- mandatorily set delimiter (otherwise MySQL/MariaDB parser throws a fit when parsing multiline procedures)
 delimiter //
@@ -558,6 +560,7 @@ set @function_count = ifnull(@function_count,0) + 1;
 //
 
 -- returns value associated with variable in customgnucash.variables
+-- use when variable value might change between calls
 drop function if exists get_variable;
 //
 create function get_variable
@@ -573,6 +576,37 @@ begin
 	then
 
 		select SQL_NO_CACHE distinct value
+		into 	l_value
+		from 	variable
+		where 	variable = trim(p_variable);
+
+	end if;
+
+	return l_value;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
+-- returns value associated with variable in customgnucash.variables
+-- identical to get_variable except for 'deterministic' pragma and no SQL_NO_CACHE
+-- used for repeating calls to the same variable where performance is an issue (such as create view account_map) and value wont change
+drop function if exists get_constant;
+//
+create function get_constant
+	(
+		p_variable 	varchar(700)
+	)
+	returns text
+	deterministic
+begin
+	declare l_value text default null;
+	
+	if 	exists_variable( p_variable) 
+	--	and not is_locked('variable', 'WAIT')
+	then
+
+		select distinct value
 		into 	l_value
 		from 	variable
 		where 	variable = trim(p_variable);
@@ -938,6 +972,7 @@ set @function_count = ifnull(@function_count,0) + 1;
 //
 
 -- adds an element to a CSV string
+-- uses group_concat rather than concat because former has hardcoded limit but latter can be set via group_concat_max_len (needs to be > default of 1024; recommended 60000)
 drop procedure if exists put_element;
 //
 create procedure put_element
@@ -946,11 +981,19 @@ create procedure put_element
 		in	p_element	varchar(1000),
 		in	p_separator	char(1)
 	)
-	no sql
 begin
 	set p_separator = ifnull(p_separator, ',');
-	if p_element is not null then
-		set p_array = trim( p_separator from concat( ifnull(p_array, '' ), p_separator, p_element) );
+	if trim(p_element) is not null then
+
+		select 	trim( p_separator from group_concat(strings.str) )
+		into 	p_array
+		from	
+		(	select trim(ifnull(p_array, '' )) as str
+			union
+			select trim(p_element)
+		) strings;
+			
+		-- set p_array = trim( p_separator from concat( ifnull(p_array, '' ), p_separator, p_element) );
 	end if;
 end;
 //
@@ -1125,7 +1168,7 @@ procedure_block:begin
 	-- call log( concat('DEBUG : START gnc_unlock(', ifnull(p_locks, 'null'), ')' ));
 	
 	-- initialise (remove dupes from list, lock gnucash db by default)
-	set p_locks = ifnull( sort_array(p_locks, 'u', ','), get_variable('Gnucash schema') );
+	set p_locks = ifnull( sort_array(p_locks, 'u', ','), get_constant('Gnucash schema') );
 
 	-- attept to grab each lock in turn; fail if ANY lock cannot be obtained
 	while_loop : while l_count <= get_element_count(p_locks, ',') and l_error is null
@@ -1137,7 +1180,7 @@ procedure_block:begin
 			-- work out if the lock refers to the gnucash db (or its tables)
 			if not l_gnucash_db_unlock_required then
 
-				if get_element(p_locks, l_count, ',') = get_variable('Gnucash schema') 
+				if get_element(p_locks, l_count, ',') = get_constant('Gnucash schema') 
 				then
 					set l_gnucash_db_unlock_required = true;
 				else
@@ -1146,7 +1189,7 @@ procedure_block:begin
 					from 	information_schema.tables
 					where	table_type = 'BASE TABLE'
 					and	upper(table_name) = upper(get_element(p_locks, l_count, ','))
-					and 	upper(table_schema) = upper(get_variable('Gnucash schema'));
+					and 	upper(table_schema) = upper(get_constant('Gnucash schema'));
 				end if;
 
 				-- if the above calc shows that a gnucash db lock is required ...
@@ -1176,7 +1219,7 @@ end;
 set @procedure_count = ifnull(@procedure_count,0) + 1;
 //
 
--- [RW] Locks Gnucash database and/or specified tables for writing
+-- [RW] Locks Gnucash database and/or specified tables for writing (actually a mutex lock using arbitrary strings that do not have to map to tablenames)
 -- [1] Gnucash database lock is designed to cause the GnuCash application to warn about being unable to obtain database locks (which can be overidden by the GUI user with unpredictable results) AND to abort write CustomGnuCash operations whilst the GnuCash GUI is open
 -- [2] Table locks are a customised implementation of MySQL "get_lock" that works between sessions (ie between a mysql-scheduled routine that updates prices, and the cron-scheduled routine that updates prices).
 -- uses variable get_variable('lock wait') to retry each lock over 'lock wait' seconds before giving up
@@ -1200,7 +1243,7 @@ begin
 	-- call log( concat('DEBUG : START gnc_lock(', ifnull(p_locks, 'null'), ')' ));
 
 	-- initialise (remove dupes from list, lock gnucash db by default)
-	set p_locks = ifnull( sort_array(p_locks, 'u', ','), get_variable('Gnucash schema') );
+	set p_locks = ifnull( sort_array(p_locks, 'u', ','), get_constant('Gnucash schema') );
 
 	-- attept to grab each lock in turn; fail if ANY lock cannot be obtained
 	while_loop : while l_count <= get_element_count(p_locks, ',') and l_error is null
@@ -1217,7 +1260,7 @@ begin
 		-- work out if the lock refers to the gnucash db (or its tables)
 		if not l_gnucash_db_lock_required then
 
-			if get_element(p_locks, l_count, ',') = get_variable('Gnucash schema') 
+			if get_element(p_locks, l_count, ',') = get_constant('Gnucash schema') 
 			then
 				set l_gnucash_db_lock_required = true;
 			else
@@ -1226,7 +1269,7 @@ begin
 				from 	information_schema.tables
 				where	table_type = 'BASE TABLE'
 				and	upper(table_name) = upper(get_element(p_locks, l_count, ','))
-				and 	upper(table_schema) = upper(get_variable('Gnucash schema'));
+				and 	upper(table_schema) = upper(get_constant('Gnucash schema'));
 			end if;
 
 			-- if the above calc shows that a gnucash db lock is required ...
@@ -1236,7 +1279,7 @@ begin
 				if get_variable('Gnucash status') != 'RW' then
 
 					set l_error = concat('WARNING : Unable to lock gnucash schema "', 
-							ifnull(get_variable('Gnucash schema'), 'unknown'),
+							ifnull(get_constant('Gnucash schema'), 'unknown'),
 							'" because it is marked as unwriteable "', get_variable('Gnucash status') ,'"'
 							);
 				else
@@ -1261,16 +1304,16 @@ begin
 						and 	pid = connection_id();
 
 						if l_lock_count > 0 then
-							call put_element(l_obtained_locks, get_variable('Gnucash schema'), ',');
+							call put_element(l_obtained_locks, get_constant('Gnucash schema'), ',');
 						else
 							set l_error = concat('ERROR : Unable to lock gnucash schema "', 
-									ifnull(get_variable('Gnucash schema'), 'unknown'),
+									ifnull(get_constant('Gnucash schema'), 'unknown'),
 									'"'
 								);
 						end if;
 					else
 						set l_error = concat('ERROR : Unable to lock gnucash schema "', 
-								ifnull(get_variable('Gnucash schema'), 'unknown'),
+								ifnull(get_constant('Gnucash schema'), 'unknown'),
 								'" because it is already locked by the Gnucash GUI.'
 							);
 					end if; -- if l_lock_count = 0
@@ -2082,8 +2125,9 @@ drop function if exists get_default_currency_guid;
 //
 create function get_default_currency_guid()
 	returns varchar(32)
+	deterministic
 begin
-	return get_commodity_guid( get_variable('Default currency'));
+	return get_commodity_guid( get_constant('Default currency'));
 end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
@@ -4718,8 +4762,8 @@ drop function if exists get_transactions_value;
 //
 create function get_transactions_value
 	(
-		p_guid1			varchar(32), -- account guid
-		p_guid2			varchar(60000), -- CSV list of account guids
+		p_guid1			varchar(32), -- account guid (always specific; children are never counted)
+		p_guid2			varchar(32), -- account guid (may include children if p_recursive=true)
 		p_currency		varchar(32),
 		p_date1			timestamp,
 		p_date2			timestamp,
@@ -4757,19 +4801,23 @@ begin
 		into 	p_date1
 		from 	transactions;
 	end if;
-	set p_date2 = ifnull(p_date2, current_timestamp);
+	-- set p_date2 = ifnull(p_date2, current_timestamp);
 
 	-- make sure dates are in the right order
 	if p_date2 < p_date1 then
-		set l_date = p_date2;
+		set l_date = ifnull(p_date2, current_timestamp);
 		set p_date2 = p_date1;
 		set p_date1 = l_date;
 	end if;
 
 	-- get list of p_guid2 subaccounts, if requested
-	if ifnull(p_recursive, false) then
-		call put_element(p_guid2 , get_account_children( p_guid2, true), ',');
-	end if;
+	-- if ifnull(p_recursive, false) then
+		-- mysql appears to have implementation limits that result in p_guid2 only containing 1024 chars
+	--	call put_element(p_guid2 , get_account_children( p_guid2, true), ',');
+	-- end if;
+
+	-- call log( concat('DEBUG : get_account_children( p_guid2, true)=', get_account_children( p_guid2, true)));
+	-- call log( concat('DEBUG : p_guid2=', p_guid2));
 
 	select
 			sum( transaction_set.value)
@@ -4786,8 +4834,12 @@ begin
 				splits splits2
 			join	transactions transactions2
 				on	transactions2.guid = splits2.tx_guid	
-		where
-				p_guid2 regexp concat( '[[:<:]]', splits2.account_guid, '[[:>:]]' )
+		where		
+			(
+				p_guid2 = splits2.account_guid
+				or
+				is_child_of( splits2.account_guid, p_guid2, ifnull(p_recursive, false) )
+			)
 			and	splits2.tx_guid in
 			(
 				select		transactions1.guid
@@ -4796,13 +4848,16 @@ begin
 					join 	splits splits1
 						on	transactions1.guid = splits1.tx_guid	
 				where 				
-						p_guid1 = splits1.account_guid
+					p_guid1 = splits1.account_guid
 					and	transactions1.post_date >= p_date1
 					and 	transactions1.post_date <= p_date2
 			)
+			and	transactions2.post_date >= p_date1
+			and 	transactions2.post_date <= p_date2
 	) transaction_set
 	limit 1;
-		-- and		splits1.value_num + splits2.value_num = 0;
+	-- p_guid2 regexp concat( '[[:<:]]', splits2.account_guid, '[[:>:]]' )
+	-- and		splits1.value_num + splits2.value_num = 0;
 
 	-- call log( 'DEBUG : END get_transactions_value');
 
@@ -5074,7 +5129,7 @@ begin
 		return null;
 	else
 		-- standardise input (uppercase, trimmed of spaces and account separators
-		set p_in = trim( upper( trim( get_variable('Account separator') from p_in) ) );
+		set p_in = trim( upper( trim( get_constant('Account separator') from p_in) ) );
 	end if;
 
 	-- try to play nicely with other procedures
@@ -5092,7 +5147,7 @@ begin
 	else
 		-- p_in is probably a name
 
-		if locate(get_variable('Account separator'), p_in ) = 0 then
+		if locate(get_constant('Account separator'), p_in ) = 0 then
 
 			select 	count(guid)
 			into 	l_count
@@ -5299,6 +5354,7 @@ create function get_account_guid
 		p_name 			varchar(2048)
 	)
 	returns varchar(32)
+	deterministic
 begin
 	declare l_guid varchar(32);
 
@@ -5311,9 +5367,9 @@ begin
 	-- try to play nicely with other procedures
 	do is_locked('accounts', 'WAIT');
 
-	set p_name = upper( trim( get_variable('Account separator') from p_name));
+	set p_name = upper( trim( get_constant('Account separator') from p_name));
 
-	if locate(get_variable('Account separator'), p_name) = 0 then
+	if locate(get_constant('Account separator'), p_name) = 0 then
 
 		select distinct guid
 		into 	l_guid
@@ -5377,6 +5433,7 @@ create function get_account_short_name
 		p_guid varchar(32)
 	)
 	returns varchar(2048)
+	deterministic
 begin
 	declare l_name varchar(2048);
 
@@ -5411,6 +5468,7 @@ create function get_account_long_name
 		p_guid varchar(32)
 	)
 	returns varchar(2048)
+	deterministic
 begin
 	declare l_name varchar(2048);
 
@@ -5631,24 +5689,18 @@ begin
 	from 	accounts accounts
 	where 	accounts.guid = p_child_guid;
 
-	if l_parent_guid = p_parent_guid then
+	if 	l_parent_guid = p_parent_guid 
+		or ( -- if simple check (above) returned nothing and a recursive check was requested, look further...
+			ifnull(p_recursive, false)
+			and get_account_children(p_parent_guid, true) regexp concat( '[[:<:]]', p_child_guid, '[[:>:]]' ) 
+			-- if locate( get_account_long_name(p_parent_guid), get_account_long_name(p_child_guid) ) > 0
+		)
+	then
 		return true;
-	else
-		-- if simple check returned nothing and a recursive check was requested, look further...
-		if  ifnull(p_recursive, false) then
-
-			if locate( get_account_long_name(p_parent_guid), get_account_long_name(p_child_guid) ) > 0 then
-				return true;
-			end if;
-
-		else
-			return false;
-		end if;
-
 	end if;
 	
-	-- if nothing found by this point, return null
-	return null;
+	-- if nothing found by this point, return false
+	return false;
 end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
@@ -5755,7 +5807,7 @@ begin
 				ifnull(p_parallel_root, 'null'), ')'
 		));
 */
-	set l_count = get_element_count( get_account_long_name(p_source_account_guid), get_variable('Account separator'));
+	set l_count = get_element_count( get_account_long_name(p_source_account_guid), get_constant('Account separator'));
 
 	if l_count > 1
 	then
@@ -5763,15 +5815,15 @@ begin
 		if p_parallel_root = 'CASH'
 		then
 			set l_parallel_account_name = concat(	
-							substring_index( get_account_long_name(p_source_account_guid), get_variable('Account separator'), (l_count-1 ) ), 
-							get_variable('Account separator'), 
+							substring_index( get_account_long_name(p_source_account_guid), get_constant('Account separator'), (l_count-1 ) ), 
+							get_constant('Account separator'), 
 							'CASH'
 							);
 		else
 			set l_parallel_account_name = concat( 	
 							p_parallel_root, 
-							get_variable('Account separator'), 
-							substring_index( get_account_long_name(p_source_account_guid), get_variable('Account separator'), -(l_count-1 ) )
+							get_constant('Account separator'), 
+							substring_index( get_account_long_name(p_source_account_guid), get_constant('Account separator'), -(l_count-1 ) )
 							);
 		end if;
 		-- call log(concat('DEBUG : l_parallel_account_name=', l_parallel_account_name));
@@ -6390,9 +6442,9 @@ begin
 	call log( concat('DEBUG : START post_account(', ifnull(p_name, 'null'), ',', ifnull(p_account_type, 'null'), ',', ifnull(p_commodity_guid, 'null'), ')'));
 
 	-- initialise
-	set p_name = trim( trim( get_variable('Account separator') from replace(p_name, '::', ':') ));
-	set l_account_count = get_element_count(p_name, get_variable('Account separator'));
-	set l_parent_guid = get_account_guid( substring_index(p_name, get_variable('Account separator'), 1 ));
+	set p_name = trim( trim( get_constant('Account separator') from replace(p_name, '::', ':') ));
+	set l_account_count = get_element_count(p_name, get_constant('Account separator'));
+	set l_parent_guid = get_account_guid( substring_index(p_name, get_constant('Account separator'), 1 ));
 
 	-- check inputs
 	if 	p_name is null
@@ -6409,8 +6461,8 @@ begin
 	-- wind through specified account name, creating any missing ones (except first one, which must *already* exist)
 	while l_count <= l_account_count do
 
-		set l_long_name =  trim( substring_index( p_name, get_variable('Account separator'), l_count ));
-		set l_short_name = trim( substring_index( l_long_name, get_variable('Account separator'), -1 ));
+		set l_long_name =  trim( substring_index( p_name, get_constant('Account separator'), l_count ));
+		set l_short_name = trim( substring_index( l_long_name, get_constant('Account separator'), -1 ));
 
 		if 	l_short_name is not null
 			and length(l_short_name) > 0 
@@ -7645,7 +7697,6 @@ procedure_block:begin
 		set l_tax_year_start = get_tax_year_end(-1);
 		set l_tax_year_end = get_tax_year_end(0);
 
-
 		-- determine cash accounts whence ISA contributions are made
 		set l_cash_accounts = get_account_children( get_account_guid( get_variable( 'Cash account' )), true);
 
@@ -7847,7 +7898,7 @@ procedure_block : begin
 		call write_report(	l_report,
 					concat(
 						'Classification|',
-						get_variable('Default currency'),
+						get_constant('Default currency'),
 						'|Allocation (%)|Allocation (graphical)'
 						),
 					'table-start');
@@ -8551,7 +8602,7 @@ procedure_block : begin
 								get_commodity_mnemonic( get_account_currency( l_account_guid ) ) ,
 								prettify( round ( l_current_unit_value_default_currency,2)) ,
 								' for a total of ',
-								get_variable('Default currency') ,
+								get_constant('Default currency') ,
 								prettify( floor( abs( l_target_total_value - l_current_total_value)))
 							);
 				
@@ -8567,7 +8618,7 @@ procedure_block : begin
 							set l_report_recommendation = concat(	l_report_recommendation,
 												'</br>(Predicted ',
 												if(ifnull(l_predicted_gain,0) < 0, 'loss ', 'gain '), 
-												get_variable('Default currency'), 
+												get_constant('Default currency'), 
 												prettify( floor( abs( ifnull(l_predicted_gain,0)))),
 												')'
 												);
@@ -8720,14 +8771,14 @@ procedure_block : begin
 	declare lc_view cursor for
 		select distinct table_name 
 		from information_schema.tables 
-		where table_schema = get_variable('Gnucash schema'); 
+		where table_schema = get_constant('Gnucash schema'); 
 	declare continue handler for not found set l_view_done =  true;
 
 	-- call log('DEBUG : START create_views');
 
 	-- get reported gnucash version
 	set l_old_table_version = get_variable( 'Gnucash.version');
-	set @g_sql = concat('select table_version into @g_new_gnucash_version from ', get_variable('Gnucash schema'), '.versions where table_name ="Gnucash"');
+	set @g_sql = concat('select table_version into @g_new_gnucash_version from ', get_constant('Gnucash schema'), '.versions where table_name ="Gnucash"');
 	prepare gnucash_version from @g_sql;
 	execute gnucash_version;
 
@@ -8754,7 +8805,7 @@ procedure_block : begin
 
 		-- check table versions to see if a view needs to be recreated
 		set l_old_table_version = get_variable( concat(l_table_name, '.version'));
-		set @g_sql = concat('select table_version into @g_new_table_version from ', get_variable('Gnucash schema'), '.versions where table_name = "', l_table_name, '"' );
+		set @g_sql = concat('select table_version into @g_new_table_version from ', get_constant('Gnucash schema'), '.versions where table_name = "', l_table_name, '"' );
 		prepare table_version from @g_sql;
 		execute table_version;
 		set l_tables_checked = true;
@@ -8765,7 +8816,7 @@ procedure_block : begin
 			or l_old_gnucash_version != @g_new_gnucash_version
 		then
 			-- create view
-			set @g_sql = concat('create or replace view ', l_table_name , ' as select * from ' , get_variable('Gnucash schema'), '.' , l_table_name);
+			set @g_sql = concat('create or replace view ', l_table_name , ' as select * from ' , get_constant('Gnucash schema'), '.' , l_table_name);
 			prepare create_view from @g_sql;
 			execute create_view;
 			set l_views_changed = true;
@@ -8775,62 +8826,70 @@ procedure_block : begin
 			call post_variable(concat(l_table_name, '.version'), @g_new_table_version);
 
 			-- log whats been done
-			call log( concat('INFORMATION : Created view ' , schema() , '.' , l_table_name , ' to table ' , get_variable('Gnucash schema') , '.' , l_table_name));
+			call log( concat('INFORMATION : Created view ' , schema() , '.' , l_table_name , ' to table ' , get_constant('Gnucash schema') , '.' , l_table_name));
 
 			-- special case for accounts table	
 			-- this view is used instead of any mysql recursive function calls which would make account tree traversal more elegant
 			if l_table_name = 'accounts' then
 
+				-- note : mysql view do not support inline variables, so function call get_constant('Account separator') is reqd
+				-- note : mysql concat has a hard limit of 1024 characters
 				create or replace view account_map as
 				    select distinct
 					accounts.guid,
 					upper(accounts.name) as short_name,
-					upper(trim(get_variable('Account separator') from replace(concat(ifnull(p10.name, ''),
-								get_variable('Account separator'),
-								ifnull(p9.name, ''),
-								get_variable('Account separator'),
-								ifnull(p8.name, ''),
-								get_variable('Account separator'),
-								ifnull(p7.name, ''),
-								get_variable('Account separator'),
-								ifnull(p6.name, ''),
-								get_variable('Account separator'),
-								ifnull(p5.name, ''),
-								get_variable('Account separator'),
-								ifnull(p4.name, ''),
-								get_variable('Account separator'),
-								ifnull(p3.name, ''),
-								get_variable('Account separator'),
-								ifnull(p2.name, ''),
-								get_variable('Account separator'),
-								ifnull(p1.name, ''),
-								get_variable('Account separator'),
-								accounts.name),
-							'Root Account',
-							''))) as long_name,
-					get_element(concat(ifnull(p10.guid, ''),
-							get_variable('Account separator'),
+					upper(
+						trim(get_constant('Account separator') from 
+							replace(
+								concat(
+									ifnull(p10.name,''),
+									get_constant('Account separator'),
+									ifnull(p9.name, ''),
+									get_constant('Account separator'),
+									ifnull(p8.name, ''),
+									get_constant('Account separator'),
+									ifnull(p7.name, ''),
+									get_constant('Account separator'),
+									ifnull(p6.name, ''),
+									get_constant('Account separator'),
+									ifnull(p5.name, ''),
+									get_constant('Account separator'),
+									ifnull(p4.name, ''),
+									get_constant('Account separator'),
+									ifnull(p3.name, ''),
+									get_constant('Account separator'),
+									ifnull(p2.name, ''),
+									get_constant('Account separator'),
+									ifnull(p1.name, ''),
+									get_constant('Account separator'),
+									accounts.name),
+							'Root Account',	'')
+						)
+					) as long_name,
+					get_element(
+						concat(
+							ifnull(p10.guid,''),
+							get_constant('Account separator'),
 							ifnull(p9.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p8.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p7.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p6.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p5.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p4.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p3.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p2.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							ifnull(p1.guid, ''),
-							get_variable('Account separator'),
+							get_constant('Account separator'),
 							accounts.guid),
-						2,
-						get_variable('Account separator')) as root_guid
+					2, get_constant('Account separator') ) as root_guid
 				    from
 					accounts
 					    left outer join
@@ -8857,7 +8916,7 @@ procedure_block : begin
 					get_commodity_mnemonic(get_account_commodity(accounts.guid)) != 'template';
 			end if;
 
-			call log( concat('INFORMATION : Created view ' , schema() , '.account_map to table ' , get_variable('Gnucash schema') , '.' , l_table_name));
+			call log( concat('INFORMATION : Created view ' , schema() , '.account_map to table ' , get_constant('Gnucash schema') , '.' , l_table_name));
 
 		end if;
 
@@ -8955,10 +9014,10 @@ procedure_block : begin
 		prepare d_sql from @g_sql;
 		execute d_sql;
 			
-		-- if time has passed the exepcted execution date, log the fact
+		-- if time has passed the expected execution date, log the fact
 		if current_timestamp > str_to_date(@g_expected_execution_date, "%Y-%m-%d %H:%i:%S") then
 		
-			-- MySQL doesnt (yet) support procedure creation or begin..end blocks
+			-- MySQL doesnt (yet) support inline procedure creation or begin..end blocks
 			-- set @g_sql = trim(regexp_replace(l_event_definition, '(begin|end)\s?(\r|$)', ''));
 			-- call log( concat('DEBUG : ', @g_sql));
 			-- prepare d_sql from @g_sql;
@@ -9152,8 +9211,6 @@ procedure_block : begin
 	begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
-
-		call write_report(l_report, concat('Error ', l_err_code , ' : ', l_err_msg ), 'plain');
 		call log(concat('ERROR : [', l_err_code , '] : customgnucash_status : ', l_err_msg ));
 	end;
 
@@ -9299,7 +9356,7 @@ procedure_block : begin
 	if not (exists_commodity(get_variable('Default currency'))
 		and is_currency(get_default_currency_guid())
 		and get_commodity_price(get_default_currency_guid(),null) = 1
-		and get_commodity_mnemonic(get_default_currency_guid()) = get_variable('Default currency')
+		and get_commodity_mnemonic(get_default_currency_guid()) = get_constant('Default currency')
 		)
 	then
 		call write_report(l_report, 'Commodity manipulation routines returned unexpected result.', 'plain');
@@ -9369,7 +9426,7 @@ procedure_block : begin
 				else
 					if l_count >= 5 
 					then
-						call log( concat('WARNING : [', l_err_code, '] the GnuCash database "', get_variable('Gnucash schema'), '" could not be written to (',l_integer1, ',',l_integer2, ',', l_integer3, ')' ));
+						call log( concat('WARNING : [', l_err_code, '] the GnuCash database "', get_constant('Gnucash schema'), '" could not be written to (',l_integer1, ',',l_integer2, ',', l_integer3, ')' ));
 					else
 						set l_count = l_count + 1;
 						do sleep( 1 + (rand() * 4 )); -- wait between 1 and 5 seconds
@@ -9452,7 +9509,7 @@ procedure_block : begin
 		into 	l_integer2
 		from	commodities
 		where 	quote_flag = 1
-		and 	mnemonic != get_variable('Default currency');
+		and 	mnemonic != get_constant('Default currency');
 
 		-- only bother checking if DB has been RW for a week or more, and there are quotes to get
 		if l_integer1 > 7 and l_integer2 > 1 then
@@ -9462,7 +9519,7 @@ procedure_block : begin
 			into	l_text1
 			from	commodities
 			where 	commodities.quote_flag = 1
-			and 	commodities.mnemonic != get_variable('Default currency')
+			and 	commodities.mnemonic != get_constant('Default currency')
            		and 	datediff(current_date, get_commodity_latest_date(commodities.guid)) > 7;
 
 			if l_text1 is not null then
@@ -9495,6 +9552,7 @@ set @procedure_count = ifnull(@procedure_count,0) + 1;
 
 
 -- [I] SCHEDULED EVENTS
+-- This is *not* the same thing as the 'scheduled transactions' you can set in the GnuCash GUI; these are internal MySQL scheduled events
 
 -- MySQL users need the EVENT privilege to manage the MySQL event scheduler :
 -- For example (as a DBA user) : GRANT EVENT ON customgnucash.* TO customgnucash;
@@ -9505,6 +9563,10 @@ set @procedure_count = ifnull(@procedure_count,0) + 1;
 -- You may need to set "event-scheduler = ON" in the [mysqld] section of your /etc/my.cnf file to start the scheduler when mysqld starts
 -- SET GLOBAL event_scheduler = ON;
 -- //
+
+-- All events ar written to honour a lock 'cusomgnucash_event'; this may not actually be necessary, but avoids the risk of overloading the system or 
+-- possible data contention issues if events either overrun or are scheduled (by accident or otherwise) to run at the same time. They will wait for 
+-- 10 minutes (600 secs) for the lock then fail, so there is a risk that some events may not run at all.
 
 -- [I.1] Housekeeping events
 
@@ -9523,14 +9585,14 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : daily_housekeeping : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT daily_housekeeping');
+	-- call log('DEBUG : START EVENT daily_housekeeping');
 
 	-- check system status
-	call customgnucash_status();
-
-	if 	get_variable('Customgnucash status') = 'OK'
+	if 	get_lock('customgnucash_event', 600)
+		and get_variable('Customgnucash status') = 'OK'
 		and get_variable('Gnucash status') =  'RW'
 	then 
 		-- check if underlying Gnucash DB has changed and replace stale views if it has (procedure does nothing if nothing required)
@@ -9547,7 +9609,9 @@ begin
 
 	end if; 
 
-	call log('DEBUG : END EVENT daily_housekeeping');
+	do release_lock('customgnucash_event');
+
+	-- call log('DEBUG : END EVENT daily_housekeeping');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9570,12 +9634,15 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : monthly_housekeeping : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT monthly_housekeeping');
+	-- call log('DEBUG : START EVENT monthly_housekeeping');
 
 	-- only proceed when lock obtained
-	if get_variable('Customgnucash status') = 'OK' then 
+	if 	get_lock('customgnucash_event', 600)
+		and get_variable('Customgnucash status') = 'OK' 
+	then 
 
 		-- clean up customgnucash log table (default : keep last 30 days only)
 		if gnc_lock('log') then
@@ -9600,8 +9667,8 @@ begin
 			order by 2 desc limit 1 
 		) default_currency;
 		
-		if l_default_currency != get_variable('Default currency') then
-			call log( concat('WARNING : your most used currency is "', l_default_currency, '" not the default currency "', get_variable('Default currency'), '". To change it, run (in MySQL) : call put_variable(''Default currency'',''', l_default_currency,''');'));
+		if l_default_currency != get_constant('Default currency') then
+			call log( concat('WARNING : your most used currency is "', l_default_currency, '" not the default currency "', get_constant('Default currency'), '". To change it, run (in MySQL) : call put_variable(''Default currency'',''', l_default_currency,''');'));
 		end if;
 
 		-- turn off quoting for commodities where a value has not been received for 'Stop quoting' (default 6) months
@@ -9611,7 +9678,7 @@ begin
 			into	l_unquoted_commodities
 			from	commodities
 			where 	commodities.quote_flag = 1
-			and 	commodities.mnemonic != get_variable('Default currency')
+			and 	commodities.mnemonic != get_constant('Default currency')
 		   	and 	datediff(current_date, get_commodity_latest_date(commodities.guid)) > ifnull(get_variable('Stop quoting'), 6) * 31;
 
 			if l_unquoted_commodities is not null and gnc_lock('commodities') then
@@ -9619,7 +9686,7 @@ begin
 				update 	commodities
 				set 	quote_flag = 0
 				where 	commodities.quote_flag = 1
-				and 	commodities.mnemonic != get_variable('Default currency')
+				and 	commodities.mnemonic != get_constant('Default currency')
 			   	and 	datediff(current_date, get_commodity_latest_date(commodities.guid)) > ifnull(get_variable('Stop quoting'), 6) * 31;
 
 				call gnc_unlock('commodities');
@@ -9630,7 +9697,9 @@ begin
 		end if;
 	end if;
 
-	call log('DEBUG : END EVENT monthly_housekeeping');
+	do release_lock('customgnucash_event');
+
+	-- call log('DEBUG : END EVENT monthly_housekeeping');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9657,17 +9726,25 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : report_anomalies : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT report_anomalies');
+	-- call log('DEBUG : START EVENT report_anomalies');
 
-	-- identify missed jobs
-	call reschedule();
+	if get_lock('customgnucash_event', 600)
+	then
 
-	-- generate anomaly report
-	call report_anomalies();
+		-- identify missed jobs
+		call reschedule();
 
-	call log('DEBUG : END EVENT report_anomalies');
+		-- generate anomaly report
+		call report_anomalies();
+
+	end if;
+
+	do release_lock('customgnucash_event');
+
+	-- call log('DEBUG : END EVENT report_anomalies');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9688,18 +9765,24 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : alert_target_allocations : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
+	-- call log('DEBUG : START EVENT alert_target_allocations');
+
 	-- give oneself a break over weekends!
-	if 	dayofweek(current_date) not in (1,7) 
+	if 	get_lock('customgnucash_event', 600)
+		and dayofweek(current_date) not in (1,7) 
 	then
-		call log('DEBUG : START EVENT alert_target_allocations');
 		-- call report_target_allocations( get_account_guid('Assets'), 'alert');
 		call report_target_allocations( get_account_guid(get_variable('Stocks ISA account'	)), 'alert');
 		call report_target_allocations( get_account_guid(get_variable('Pensions account'	)), 'alert');
 		call report_target_allocations( get_account_guid(get_variable('Funds and shares account')), 'alert');
-		call log('DEBUG : END EVENT alert_target_allocations');
 	end if;
+
+	do release_lock('customgnucash_event');
+
+	-- call log('DEBUG : END EVENT alert_target_allocations');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9727,11 +9810,18 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : report_remaining_isa_allowance : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT report_remaining_isa_allowance');
-	call report_remaining_isa_allowance(null);
-	call log('DEBUG : END EVENT report_remaining_isa_allowance');
+	-- call log('DEBUG : START EVENT report_remaining_isa_allowance');
+	if get_lock('customgnucash_event', 600)
+	then
+		call report_remaining_isa_allowance(null);
+	end if;
+
+	do release_lock('customgnucash_event');
+
+	-- call log('DEBUG : END EVENT report_remaining_isa_allowance');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9758,13 +9848,19 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : report_target_allocations : ', l_err_msg ));
+	do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT report_target_allocations');
-	call report_target_allocations( get_account_guid(get_variable('Stocks ISA account'	)), 'report');
-	call report_target_allocations( get_account_guid(get_variable('Pensions account'	)), 'report');
-	call report_target_allocations( get_account_guid(get_variable('Funds and shares account')), 'report');
-	call log('DEBUG : END EVENT report_target_allocations');
+	-- call log('DEBUG : START EVENT report_target_allocations');
+	if get_lock('customgnucash_event', 600)
+	then
+		call report_target_allocations( get_account_guid(get_variable('Stocks ISA account'	)), 'report');
+		call report_target_allocations( get_account_guid(get_variable('Pensions account'	)), 'report');
+		call report_target_allocations( get_account_guid(get_variable('Funds and shares account')), 'report');
+	end if;
+
+	do release_lock('customgnucash_event');
+	-- call log('DEBUG : END EVENT report_target_allocations');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9791,12 +9887,18 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : report_asset_allocations : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT report_asset_allocations');
-	call report_asset_allocation( get_account_guid('Assets'), 'Asset class', current_timestamp );
-	call report_asset_allocation( get_account_guid('Assets'), 'Location', current_timestamp );
-	call log('DEBUG : END EVENT report_asset_allocations');
+	-- call log('DEBUG : START EVENT report_asset_allocations');
+	if get_lock('customgnucash_event', 600)
+	then
+		call report_asset_allocation( get_account_guid('Assets'), 'Asset class', current_timestamp );
+		call report_asset_allocation( get_account_guid('Assets'), 'Location', current_timestamp );
+	end if;
+
+	do release_lock('customgnucash_event');
+	-- call log('DEBUG : END EVENT report_asset_allocations');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9823,11 +9925,17 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : report_account_gains : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT report_account_gains');
-	call report_account_gains( get_account_guid('Assets'), null, null );
-	call log('DEBUG : END EVENT report_account_gains');
+	-- call log('DEBUG : START EVENT report_account_gains');
+	if get_lock('customgnucash_event', 600)
+	then
+		call report_account_gains( get_account_guid('Assets'), null, null );
+	end if;
+
+	do release_lock('customgnucash_event');
+	-- call log('DEBUG : END EVENT report_account_gains');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9852,11 +9960,17 @@ begin
 		get diagnostics condition 1
 		        l_err_code = RETURNED_SQLSTATE, l_err_msg = MESSAGE_TEXT;
 		call log(concat('ERROR : [', l_err_code , '] : report_uk_tax : ', l_err_msg ));
+		do release_lock('customgnucash_event');
 	end;
 
-	call log('DEBUG : START EVENT report_uk_tax');
-	call report_uk_tax( -1 );
-	call log('DEBUG : END EVENT report_uk_tax');
+	-- call log('DEBUG : START EVENT report_uk_tax');
+	if get_lock('customgnucash_event', 600)
+	then
+		call report_uk_tax( -1 );
+	end if;
+
+	do release_lock('customgnucash_event');
+	-- call log('DEBUG : END EVENT report_uk_tax');
 end;
 //
 set @event_count = ifnull(@event_count,0) + 1;
@@ -9866,7 +9980,7 @@ set @event_count = ifnull(@event_count,0) + 1;
 
 -- System control parameters
 
--- Dump "call log()" errors to console instead of log table if Debug=Y
+-- Log DEBUG log messages in log table if Y
 call post_variable ('Debug', 'N');
 //
 -- the name of the schema the GnuCash GUI uses (customgnucash will create synonyms to tables in schema named here)
