@@ -1,7 +1,7 @@
 /*
 GnuCash MySql routines
 Author : Adam Harrington
-Date : 13 October 2015
+Date : 5 November 2015
 */
 
 -- Customgnucash actions below are marked [R] if they require Readonly access to the gnucash database, [W] Writeonly and [RW] for both.
@@ -1999,26 +1999,36 @@ set @procedure_count = ifnull(@procedure_count,0) + 1;
 -- if p_num >1 then >1 reports will be emitted in one lump of text
 drop procedure if exists get_report;
 //
-create procedure get_report
-	(
-		p_num		tinyint
+create procedure get_report 
+	( 
+		p_num 	tinyint
 	)
 procedure_block : begin
-	declare l_variable	varchar(700);
-	declare l_value 	text;
-	declare l_report	text;
-	declare l_count		tinyint;
-	declare l_report_count	tinyint;
-	declare l_html_header 	varchar(500);
-	declare l_html_footer 	varchar(50);
+	declare l_variable 		varchar(250);
+	declare l_value 		text; 
+	declare l_report 		text;
+	declare l_html_header 		varchar(500);
+	declare l_html_footer 		varchar(50);
+	declare l_report_done_temp 	boolean default false;
+	declare l_report_done 		boolean default false;
+
+	declare lc_report cursor for
+		select distinct 
+			variable, 
+			value 
+		from 
+			variable 
+		where 
+			variable like 'report\_%' 
+		order by 
+			logdate asc 
+		limit 	p_num;
+	declare continue handler for not found set l_report_done =  true;
 
 	-- call log( concat('DEBUG : START get_report(', ifnull(p_num, 'null'), ')' ));
 
 	-- try to play nicely with other procedures
 	do is_locked('variable', 'WAIT');
-
-	set l_count = 1;
-	set p_num = ifnull(p_num, 1);
 
 	set l_html_header = concat(	'<html><head><style>',
 					get_variable('Report CSS'),
@@ -2027,34 +2037,25 @@ procedure_block : begin
 
 	set l_html_footer = '</body></html>';
 
-	-- check how many reports there are
-	select 	count(*)
-	into 	l_report_count
-	from	variable
-	where	variable.variable like 'report\_%';
+	-- only collect p_num reports, or as many as there are, whichever is least
+	select 	least(count(*), ifnull(p_num, 1)) 
+	into 	p_num 
+	from 	variable 
+	where 	variable.variable like 'report\_%';
 
-	-- extract reports
-	while l_count <= least(p_num, l_report_count) do
+	open lc_report;
+	set l_report_done = false;
 
-		select
-			variable.variable,
-			variable.value
-		into
-			l_variable,
-			l_value
-		from
-			variable
-		where
-			variable.variable like 'report\_%'
-		order by
-			logdate asc
-			-- date(replace( substring_index(variable.variable, '(', -1), ')', '')) asc
-		limit 1;
+	report_loop : loop
 
-		-- delete report from variables table
-		call delete_variable(l_variable);
-	
-		-- add to list of reports if there is anything to add
+		fetch lc_report into l_variable, l_value;
+
+		if l_report_done then 
+			leave report_loop;
+		else
+			set l_report_done_temp = l_report_done;
+		end if;
+
 		if l_value is not null then
 			set l_report = concat( 
 						ifnull(l_report,''), 
@@ -2063,16 +2064,19 @@ procedure_block : begin
 					);
 		end if;
 
-		set l_count = l_count + 1;
+		-- delete report from variables table
+		call delete_variable(l_variable);
 
-	end while;
+		set l_report_done = l_report_done_temp;
+													
+	end loop; -- report_loop
 
 	-- return report if there is one
 	if l_report is not null then
-		select concat(l_html_header, l_report, l_html_footer);
+		select concat(l_html_header, l_report, l_html_footer) as report;
 	else
 		-- needs to return '' not NULL so calling linux script can see there is nothing in the report
-		select '';
+		select '' as report;
 	end if;
 
 	-- call log('DEBUG : END get_report');
