@@ -1,7 +1,7 @@
 /*
 GnuCash MySql routines
 Author : Adam Harrington
-Date : 5 November 2015
+Date : 27 June 2016
 */
 
 -- Customgnucash actions below are marked [R] if they require Readonly access to the gnucash database, [W] Writeonly and [RW] for both.
@@ -849,12 +849,13 @@ procedure_block : begin
 
 	-- call log( concat('DEBUG : START post_commodity_attribute(', ifnull(p_guid, 'null'), ',' , ifnull(p_field, 'null'), ',' , ifnull(p_date, 'null'), ',' , ifnull(p_value, 'null'), ')' ));
 	
-	-- dont bother trying to insert useless, already inserted or very old (+5 years) values
+	-- dont bother trying to insert useless, already inserted or very old values
 	if 	length(trim(ifnull(p_value, '') )) = 0
 		or p_value like '%missing%'
 		or p_date is null
 		or p_date > current_timestamp
-		or datediff(current_timestamp, p_date) > (365.25 * 5)
+		or p_date < date_add(current_timestamp, interval - get_variable('Maximum quote age') year)
+		-- or datediff(current_timestamp, p_date) > (365.25 * get_variable('Maximum quote age'))
 		or not exists_commodity(p_guid)
 		or exists_commodity_attribute(p_guid, p_field, p_date)
 
@@ -4086,7 +4087,7 @@ create function post_commodity_price
 		p_date			timestamp,
 		p_currency		varchar(32),
 		p_value			decimal(20,6),
-		p_source		varchar(255)
+		p_source		varchar(2048)
 	)
 	returns varchar(32)
 begin
@@ -4119,7 +4120,7 @@ begin
 		and is_currency(p_currency)
 		and is_number(p_value)
 		and p_date <= current_date
-		and p_date >= date_add(current_date, interval -10 year)
+		and p_date >= date_add(current_date, interval - get_variable('Maximum quote age') year)
 	then
 		-- set defaults
 		set l_previous_date 	= date_add(p_date, interval - 1 day);
@@ -4150,7 +4151,7 @@ begin
 			end if;
 		end if;
 
-		-- insert price values of they appear sane
+		-- insert price values if they appear sane
 		case
 
 			-- minor faults (which actually occur too often to be bothered about)
@@ -4203,7 +4204,7 @@ begin
 					values (
 						l_guid,
 						p_commodity,
-						ifnull(get_commodity_currency(p_commodity), get_commodity_guid(trim(p_currency))),
+						ifnull(get_commodity_currency(p_commodity), p_currency),
 						p_date,
 						ifnull(p_source, 'Finance::Quote'),
 						'last',
@@ -7191,7 +7192,11 @@ procedure_block : begin
 			and get_account_type(guid) in ('ASSET', 'STOCK')
 			and not is_placeholder(guid)
 			and get_account_commodity(guid) != get_default_currency_guid()
-			and exists_transaction(
+			and get_account_commodity(guid) != get_default_currency_guid()
+			-- if there are fewer units in acct now than day after gains were calced...
+			and get_account_units(guid, null, date_add(str_to_date(get_variable(concat('post_gain(', guid ,')')), '%Y-%m-%d %H:%i:%S'), interval 1 day)) >
+				get_account_units(guid, null, null);
+/*			and exists_transaction(
 				guid, 
 				get_account_guid(get_related_account(guid, 'CASH')),
 				ifnull(
@@ -7200,7 +7205,7 @@ procedure_block : begin
 				),
 				current_date
 				);
-			-- and get_account_attribute(guid, 'ASSET CLASS') not in ('MUTUAL FUND', 'PROPERTY')
+*/			-- and get_account_attribute(guid, 'ASSET CLASS') not in ('MUTUAL FUND', 'PROPERTY')
 	declare continue handler for not found set l_asset_account_done =  true;
 
 	-- call log('DEBUG : START post_all_gains');
@@ -8191,7 +8196,7 @@ procedure_block : begin
 	set p_guid = ifnull(p_guid, get_account_guid('Assets'));
 	set p_variable = ifnull(p_variable, 'TYPE');
 	set p_date = round_timestamp(ifnull(p_date, current_timestamp));
-	set l_total = get_account_value( p_guid, null, null, p_date, true);
+	set l_total = get_account_value( p_guid, get_default_currency_guid(), null, p_date, true);
 
 	-- loop through each account to be assessed
 	open lc_account_list;	
@@ -10374,6 +10379,9 @@ call post_variable ('Price check', '30');
 -- number of months for which no quote was received for a commodity, after which quoting is automatically stopped (see monthly_housekeeping)
 call post_variable ('Stop quoting', '6'); 
 //
+-- number of years back before which incoming quote data is considered too old to bother with (can be increased to load in a heap of old data, for example)
+call post_variable ('Maximum quote age', '5'); 
+//
 -- number of days to calculate EMAs, MACDs or PPOs for at initialisation (the longer the more accurate, given the starting position of an SMA)
 call post_variable ('EMA initialisation', '100'); 
 //
@@ -10430,7 +10438,7 @@ call post_variable('House price index', 'XHS');
 -- Report control parameters
 -- Customgnucash reports are stored in a local table and are extracted to console (to email via the OS, or whatever you want to do with them) through the "get_reports" procedure.
 
--- If 'Error' then report CustomGnucash ERRORs only; if 'Warning' then both WARNINGs and ERRORs, if 'Information', then INFORMATION, WARNING and ERROR reports. 'Off' means no error reporting (report_anomalies)
+-- If 'Error' then report CustomGnucash ERRORs only; if 'Warning' then both WARNINGs and ERRORs, if 'Information', then INFORMATION, WARNING and ERROR reports. 'Off' means no error reporting (report_anomalies) This doesnt affect whether logs are made, just whether they are reported
 call post_variable ('Error level', 'Error');
 //
 -- Dont run CustomGnucash reports if Reports=N
