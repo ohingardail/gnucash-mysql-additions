@@ -1,7 +1,7 @@
 /*
 GnuCash MySql routines
 Author : Adam Harrington
-Date : 27 June 2016
+Date : 5 September 2018
 */
 
 -- Customgnucash actions below are marked [R] if they require Readonly access to the gnucash database, [W] Writeonly and [RW] for both.
@@ -15,7 +15,7 @@ Date : 27 June 2016
 -- Adding a few indices to the Gnucash db (see below) helps a little
 
 -- Safety
--- A non-GnuCash database should be used (such ss 'customgnucash')
+-- A non-GnuCash database should be used (such as 'customgnucash')
 -- - we want to minimise interference with default GnuCash behaviour or upgrade paths
 -- the customgnucash database and its routines should be accessed by a specified user (such as 'customgnucash')
 -- - this means we can control access to the real gnucash db
@@ -50,7 +50,6 @@ Date : 27 June 2016
 
 -- LINUX> mysql --user=customgnucash --password=<customgnucash password> --database=customgnucash < CustomGnucash.sql
 
-
 -- SCRIPT STARTS HERE
 
 -- Optionally hard-code this script
@@ -61,12 +60,9 @@ Date : 27 June 2016
 -- PIPES_AS_CONCAT ('something' || 'something else') it only used when create log messages; concat('something','something else') is more standard
 -- set sql_mode=PIPES_AS_CONCAT;
 -- set global group_concat_max_len=60000; -- required to allow group_concat to list up to 800 account guids
--- set sql_log_bin = 0; -- turn off binary logging OR 
-
 
 -- mandatorily set delimiter (otherwise MySQL/MariaDB parser throws a fit when parsing multiline procedures)
 delimiter //
-
 
 -- PROTOTYPES
 -- These dummy (stubbed) functions and procedures are created in advance to ensure the remaining script compiles irrespective of the order of create commands
@@ -786,7 +782,7 @@ begin
 		from 	commodity_attribute
 		where	upper(trim(p_guid))				= upper(trim(commodity_guid))
 			and ifnull(upper(trim(p_field)), 'NULL') 	= ifnull(upper(trim(field)), 'NULL')
-			and ifnull(p_date, 'NULL') 			= ifnull(value_date, 'NULL');
+			and ifnull(p_date, current_timestamp) 		= ifnull(value_date, current_timestamp);
 	-- end if;
 
 	-- call log('DEBUG : END exists_commodity_attribute');
@@ -812,19 +808,19 @@ begin
 
 	-- call log( concat('DEBUG : START get_commodity_attribute(', ifnull(p_guid, 'null'), ',' , ifnull(p_field, 'null'), ',' , ifnull(p_date, 'null'), ')' ));
 	
-	if 	exists_commodity_attribute(p_guid, p_field, p_date) 
+	-- if 	exists_commodity_attribute(p_guid, p_field, p_date) 
 	--	and not is_locked('commodity_attribute', 'WAIT')
-	then
+	-- then
 
 		select distinct value
 		into 	l_value
 		from 	commodity_attribute
 		where	upper(trim(p_guid))				= upper(trim(commodity_guid))
 			and ifnull(upper(trim(p_field)), 'NULL') 	= ifnull(upper(trim(field)), 'NULL')
-			and ifnull(p_date, 'NULL') 			= ifnull(value_date, 'NULL')
+			and ifnull(p_date, current_timestamp) 		>= ifnull(value_date, current_timestamp)
 		order by value_date desc
 		limit 1;
-	end if;
+	-- end if;
 
 	-- call log('DEBUG : END get_commodity_attribute');
 
@@ -849,15 +845,17 @@ procedure_block : begin
 
 	-- call log( concat('DEBUG : START post_commodity_attribute(', ifnull(p_guid, 'null'), ',' , ifnull(p_field, 'null'), ',' , ifnull(p_date, 'null'), ',' , ifnull(p_value, 'null'), ')' ));
 	
-	-- dont bother trying to insert useless, already inserted or very old values
+	-- dont bother trying to insert useless, incomplete, already inserted or very old values
 	if 	length(trim(ifnull(p_value, '') )) = 0
 		or p_value like '%missing%'
 		or p_date is null
+		or date_format(p_date, '%Y') = '0000'
 		or p_date > current_timestamp
 		or p_date < date_add(current_timestamp, interval - get_variable('Maximum quote age') year)
 		-- or datediff(current_timestamp, p_date) > (365.25 * get_variable('Maximum quote age'))
 		or not exists_commodity(p_guid)
-		or exists_commodity_attribute(p_guid, p_field, p_date)
+		-- or exists_commodity_attribute(p_guid, p_field, p_date) 	-- specific to a date
+		or get_commodity_attribute(p_guid, p_field, p_date) = p_value 	-- returns latest value
 
 		-- log the fact this function is running so that it isnt accidentally called recursively later
 		or not gnc_lock('post_commodity_attribute')
@@ -991,15 +989,15 @@ drop function if exists get_element;
 //
 create function get_element
 	(
-		p_array		varchar(60000),
-		p_index		tinyint,
+		p_array		text, -- varchar(60000),
+		p_index		int,
 		p_separator	char(1)
 	)
-	returns varchar(1000)
+	returns text -- varchar(1000),
 	no sql
 begin
-	declare l_len 		tinyint;
-	declare l_count 	tinyint;
+	declare l_len 		int;
+	declare l_count 	int;
 
 	set p_index = ifnull(p_index,0);
 	set p_separator = ifnull(p_separator, ',');
@@ -1024,7 +1022,7 @@ begin
 		set l_len = 1;
 	end if;
 
-	return substring_index( substring_index(  p_array , p_separator , p_index ), p_separator, l_len);
+	return trim(substring_index( substring_index(  p_array , p_separator , p_index ), p_separator, l_len));
 end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
@@ -1035,10 +1033,10 @@ drop function if exists get_element_count;
 //
 create function get_element_count
 	(
-		p_array		varchar(60000),
+		p_array		text, -- varchar(60000),
 		p_separator	char(1)
 	)
-	returns tinyint
+	returns int
 	no sql
 begin
 	set p_separator = ifnull(p_separator, ',');
@@ -1056,8 +1054,8 @@ drop procedure if exists put_element;
 //
 create procedure put_element
 	(
-		inout	p_array		varchar(60000),
-		in	p_element	varchar(1000),
+		inout	p_array		text, -- varchar(60000),
+		in	p_element	text, -- varchar(60000),
 		in	p_separator	char(1)
 	)
 begin
@@ -1085,15 +1083,15 @@ drop function if exists sort_array;
 //
 create function sort_array
 	(
-		p_array		varchar(60000),
+		p_array		text, -- varchar(60000),
 		p_flag		char(1), -- 'u' for unique sort; default null to include all values, dupes and all
 		p_separator	char(1)
 	)
-	returns varchar(60000)
+	returns text -- varchar(60000)
 begin
-	declare l_sorted_array 		varchar(60000);
-	declare l_count 		tinyint;
-	declare l_element 		varchar(1000);
+	declare l_sorted_array 		text; -- varchar(60000);
+	declare l_count 		int;
+	declare l_element 		text; -- varchar(1000);
 	declare l_tally_done 		boolean default false;
 	declare l_tally_done_temp	boolean default false;
 
@@ -1190,7 +1188,7 @@ create function is_locked
 	no sql
 begin
 	declare l_lock 		boolean;
-	declare l_count		tinyint;
+	declare l_count		int;
 	declare l_start		timestamp default sysdate();
 
 	-- call log( concat('DEBUG : START is_locked(', ifnull(p_locks, 'null'), ',', ifnull(p_mode, 'null'), ')' ));
@@ -1241,7 +1239,7 @@ create procedure gnc_unlock
 		p_locks		varchar(1000) -- CSV string of lock names
 	)
 procedure_block:begin
-	declare l_count					tinyint default 1;
+	declare l_count					int default 1;
 	declare l_gnucash_db_unlock_required 		boolean default false;
 	declare	l_error					varchar(1000);
 
@@ -1317,8 +1315,8 @@ begin
 	declare l_obtained_locks			varchar(1000);
 	declare l_gnucash_db_lock_required 		boolean default false;
 	declare l_customgnucash_db_lock_required 	boolean default false;
-	declare l_count					tinyint default 1;
-	declare l_lock_count				tinyint default 0;
+	declare l_count					int default 1;
+	declare l_lock_count				int default 0;
 	declare	l_error					varchar(1000);
 
 	-- call log( concat('DEBUG : START gnc_lock(', ifnull(p_locks, 'null'), ')' ));
@@ -1554,7 +1552,7 @@ drop function if exists get_tax_year_end;
 //
 create function get_tax_year_end
 	(
-		p_index	tinyint
+		p_index	int
 	)	
 	returns timestamp
 begin
@@ -1587,15 +1585,15 @@ create procedure get_series
 	(
 		p_series_name			varchar(64), 	-- the name of the series (usually a function name like 'get_commodity_ema')
 		p_criteria			varchar(700), 	-- field specification criteria
-		p_x_axis			tinyint		-- the number of the field which will act as x-axis (usually the date field)
+		p_x_axis			int		-- the number of the field which will act as x-axis (usually the date field)
 	)
 procedure_block : begin
 	declare l_fieldspec			varchar(700);
 	declare l_criterion 			varchar(100);
-	declare l_criterion_position 		tinyint;
-	declare l_criterion_previous_position 	tinyint;
+	declare l_criterion_position 		int;
+	declare l_criterion_previous_position 	int;
 	declare l_criterion_string 		varchar(100);
-	declare l_count 			tinyint;
+	declare l_count 			int;
 	declare l_separator			char(1);
 
 	set l_count=1;
@@ -1678,10 +1676,10 @@ create procedure delete_series
 procedure_block : begin
 	declare l_fieldspec			varchar(700);
 	declare l_criterion 			varchar(100);
-	declare l_criterion_position 		tinyint;
-	declare l_criterion_previous_position 	tinyint;
+	declare l_criterion_position 		int;
+	declare l_criterion_previous_position 	int;
 	declare l_criterion_string 		varchar(100);
-	declare l_count 			tinyint;
+	declare l_count 			int;
 	declare l_separator			char(1);
 
 	-- call log('DEBUG : START delete_series');
@@ -1696,7 +1694,7 @@ procedure_block : begin
 
 		set p_criteria = sort_array(p_criteria, 'u', null);
 
-		-- loop through each elementy in user defined fieldspec
+		-- loop through each element in user defined fieldspec
 		while l_count <= get_element_count(p_criteria, ',') do
 
 			if l_count = 1 then
@@ -2002,7 +2000,7 @@ drop procedure if exists get_report;
 //
 create procedure get_report 
 	( 
-		p_num 	tinyint
+		p_num 	int
 	)
 procedure_block : begin
 	declare l_variable 		varchar(250);
@@ -2097,7 +2095,7 @@ create function exists_commodity
 	)
 	returns boolean
 begin
-	declare l_count 	tinyint default 0;
+	declare l_count 	int default 0;
 
 	-- check sane values
 	if p_in is null
@@ -2315,7 +2313,7 @@ create function exists_price
 	)
 	returns 		boolean
 begin
-	declare l_count tinyint;
+	declare l_count int;
 
 	-- set default date
 	set p_date = ifnull(p_date, current_timestamp);
@@ -3161,7 +3159,7 @@ create procedure get_commodity_ppo
 		out p_ppo_histogram		decimal(6,3)
 	)
 procedure_block : begin
-	declare l_counter 				tinyint default 0;
+	declare l_counter 				int default 0;
 	declare l_date					timestamp;
 	declare l_multiplier				decimal(15,5);	
 	declare l_earliest_date				timestamp;
@@ -3172,9 +3170,9 @@ procedure_block : begin
 	declare l_ppo_line_variable_name		varchar(100);	
 	declare l_ppo_signal_line_variable_name		varchar(100);
 	declare l_ppo_histogram_variable_name		varchar(100);
-	declare l_short_ema_days			tinyint;
-	declare l_long_ema_days				tinyint;
-	declare l_signal_days				tinyint;
+	declare l_short_ema_days			int;
+	declare l_long_ema_days				int;
+	declare l_signal_days				int;
 
 	-- call log( concat('DEBUG : START get_commodity_ppo(', ifnull(p_guid, 'null'), ',', ifnull(p_date, 'null'),')'));
 
@@ -3377,14 +3375,14 @@ create procedure get_commodity_so
 		out p_so_signal_line		decimal(6,3)
 	)
 procedure_block : begin
-	declare l_days				tinyint;
-	declare l_period			tinyint;
+	declare l_days				int;
+	declare l_period			int;
 	declare l_date				timestamp;
 	declare l_high				decimal(20,6);
 	declare l_low				decimal(20,6);
 	declare l_earliest_date			timestamp;
 	declare l_latest_date			timestamp;
-	declare l_count				tinyint;
+	declare l_count				int;
 	declare	l_fast_variable_name		varchar(250);
 	declare	l_slow_variable_name		varchar(250);
 	declare	l_signal_variable_name		varchar(250);
@@ -3588,7 +3586,7 @@ begin
 	declare l_strong_vote 		decimal(6,3);
 	declare l_mild_vote 		decimal(6,3);
 	declare l_observation 		varchar(100);
-	declare l_days_back		tinyint;
+	declare l_days_back		int;
 
 	-- SO variables
 	declare l_fast_so_line 		decimal(6,3);
@@ -3599,9 +3597,9 @@ begin
 	declare l_ppo_line 			decimal(6,3);
 	declare l_ppo_signal_line		decimal(6,3);
 	declare l_ppo_histogram			decimal(6,3);
-	declare l_short_ema_days		tinyint;
-	declare l_long_ema_days			tinyint;
-	declare l_signal_days			tinyint;
+	declare l_short_ema_days		int;
+	declare l_long_ema_days			int;
+	declare l_signal_days			int;
 	declare l_gradient_sensitivity		decimal(2,1);
 	declare l_ppo_line_gradient		decimal(4,3);
 	declare l_ppo_histogram_gradient	decimal(4,3);
@@ -3609,8 +3607,8 @@ begin
 	declare l_previous_ppo_histogram	decimal(6,3) default null;
 
 	-- extremes variables
-	declare l_days_since_high		tinyint;
-	declare l_days_since_low		tinyint;
+	declare l_days_since_high		int;
+	declare l_days_since_low		int;
 
 	-- call log( concat('DEBUG : START get_signal(', ifnull(p_guid, 'null'), ',', ifnull(p_unit_change, 'null'), ',',  ifnull(p_predicted_gain, 'null'), ',', ifnull(p_date, 'null'), ')'));
 
@@ -3640,7 +3638,7 @@ begin
 		metric			varchar(100),
 		metric_date		timestamp,
 		observation		varchar(100),
-		vote			tinyint, -- +ve vote = buy, -ve vote = sell
+		vote			int, -- +ve vote = buy, -ve vote = sell
 		primary key (metric)
 	);
 
@@ -4076,7 +4074,7 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
--- [RW] Adds a new commodity price to the commodity table
+-- [RW] Adds a new commodity price to the commodity price table
 -- if its sane, and hasn't already been added
 -- designed to be called from an OS scheduler using gnc-fq-dump to obtain quotes :
 drop function if exists post_commodity_price;
@@ -4116,6 +4114,8 @@ begin
 	
 	if 	p_commodity is not null
 		and p_currency is not null
+		and p_date is not null
+		and date_format(p_date, '%Y') != '0000'
 		and exists_commodity(p_commodity) 
 		and is_currency(p_currency)
 		and is_number(p_value)
@@ -4288,6 +4288,16 @@ procedure_block : begin
 	then
 		set p_guid = get_commodity_guid(p_guid);
 	end if;
+
+	-- delete prices with malformed dates (which could only appear if there's been a bug elsewhere - but it has happened!)
+	delete from prices
+	where 	date_format(prices.date, '%Y') = '0000'
+		and (p_guid is null or p_guid = prices.commodity_guid); 
+
+	delete from commodity_attribute
+	where 	date_format(commodity_attribute.value_date, '%Y') = '0000'
+		and commodity_attribute.field in ('last', 'price')
+		and (p_guid is null or p_guid = commodity_attribute.commodity_guid); 
 
 	-- add prices that are in commodity_attributes but missing from prices (within the last get_variable('Price check') days)
 	missing_prices : begin
@@ -4726,7 +4736,7 @@ create function exists_split
 	)
 	returns 			boolean
 begin
-	declare l_count 		tinyint;
+	declare l_count 		int;
 
 	-- try to play nicely with other procedures
 	do is_locked('transactions, splits', 'WAIT');
@@ -4774,7 +4784,7 @@ create function exists_transaction
 	)
 	returns 			boolean
 begin
-	declare l_count 		tinyint;
+	declare l_count 		int;
 	declare l_date			timestamp;
 
 	-- check for sane input
@@ -4851,9 +4861,9 @@ create function get_transaction_accounts
 	(
 		p_guid	varchar(32)
 	)
-	returns varchar(60000)
+	returns text -- varchar(60000)
 begin
-	declare l_accounts	varchar(60000);
+	declare l_accounts	text; -- varchar(60000);
 
 	-- try to play nicely with other procedures
 	do is_locked('transactions, splits', 'WAIT');
@@ -5087,7 +5097,7 @@ create function post_split
 	)
 	returns varchar(32)
 begin
-	declare l_exists		tinyint default 0;
+	declare l_exists		int default 0;
 	declare l_guid			varchar(32);
 	declare l_default_currency	varchar(32);
 	declare l_value_denom		bigint(20);
@@ -5096,8 +5106,8 @@ begin
 	declare l_quantity_num_from 	bigint(20);
 	declare l_quantity_denom_to	bigint(20);
 	declare l_quantity_num_to 	bigint(20); 
-	declare l_all_accounts		varchar(60000);
-	declare	l_count			tinyint default 1;
+	declare l_all_accounts		text; -- varchar(60000);
+	declare	l_count			int default 1;
 
 	-- call log( concat('DEBUG : START post_split(', ifnull(p_account_from, 'null'), ',', ifnull(p_account_to, 'null'), ',', ifnull(p_value, 'null'), ',', ifnull(p_transaction_guid, 'null'), ',', ifnull(p_date_posted, 'null'), ',', ifnull(p_description, 'null'), ')' ));
 
@@ -5162,11 +5172,9 @@ begin
 		or get_account_type( p_account_from ) in ('ASSET','STOCK')
 	then
 		while_loop : while l_count <= get_element_count(l_all_accounts, null) do
-
 			if 		is_child_of( get_element(l_all_accounts, l_count, null), get_account_guid(get_variable( 'Capital gains account' )),	true)
 				or 	is_child_of( get_element(l_all_accounts, l_count, null), get_account_guid(get_variable( 'Dividends account' )),		true)
 			then
-
 				if 	get_account_type( p_account_to ) in ('ASSET','STOCK')
 				then
 					set l_quantity_denom_to = 1;
@@ -5321,11 +5329,11 @@ drop function if exists exists_account;
 //
 create function exists_account
 	(
-		p_in 		varchar(60000)
+		p_in 		text -- varchar(60000)
 	)
 	returns 		boolean
 begin
-	declare l_count 	tinyint;
+	declare l_count 	int;
 
 	-- check sane values
 	if p_in is null
@@ -5388,7 +5396,7 @@ create function is_placeholder
 	)
 	returns 	boolean
 begin
-	declare l_placeholder tinyint;
+	declare l_placeholder int;
 
 	-- sanity check
 	if 	p_guid is null
@@ -5420,7 +5428,7 @@ create function is_used
 	)
 	returns 	boolean
 begin
-	declare l_count tinyint;
+	declare l_count int;
 
 	-- sanity check
 	if 	p_guid is null
@@ -5455,7 +5463,7 @@ create function is_hidden
 	)
 	returns 	boolean
 begin
-	declare l_hidden tinyint;
+	declare l_hidden int;
 
 	-- sanity check
 	if 	p_guid is null
@@ -5487,7 +5495,7 @@ create function is_parent
 	)
 	returns boolean
 begin
-	declare l_count tinyint;
+	declare l_count int;
 
 	-- call log( concat('DEBUG : START is_parent(', ifnull(p_guid, 'null'), ')' ));
 
@@ -5770,9 +5778,9 @@ create function get_account_children
 		p_guid 			varchar(32),
 		p_recursive		boolean
 	)
-	returns varchar(60000)
+	returns text -- varchar(60000)
 begin
-	declare l_guid 			varchar(60000);
+	declare l_guid 			text; -- varchar(60000);
 	declare l_long_name		varchar(2048);
 
 	-- call log( concat('DEBUG : START get_account_children(', ifnull(p_guid, 'null'), ',', ifnull(p_recursive, 'null'), ')' ));
@@ -5895,7 +5903,7 @@ create function is_child_of
 		p_recursive	boolean
 	)
 	returns boolean
-	deterministic
+	-- deterministic
 begin
 	declare l_parent_guid	varchar(32);
 
@@ -5953,7 +5961,7 @@ begin
 	declare l_attributes		varchar(2048);
 	declare l_attribute_value	varchar(2048);
 	declare l_accounts		varchar(2048);
-	declare l_counter		tinyint default 1;
+	declare l_counter		int default 1;
 
 	-- sanity check
 	if 	p_guid is null
@@ -6029,7 +6037,7 @@ create function get_related_account
 	)
 	returns varchar(2048)
 begin
-	declare l_count 		tinyint default 0;
+	declare l_count 		int default 0;
 	declare l_parallel_account_name	varchar(2048);
 
 	-- call log( concat(	'DEBUG : START get_related_account(', 
@@ -6730,13 +6738,13 @@ begin
 	declare l_guid			varchar(32) default null;
 	declare l_parent_guid		varchar(32);
 	declare l_short_name		varchar(2048);
-	declare l_long_name		varchar(60000);
+	declare l_long_name		text; -- varchar(60000);
 	declare l_account_type		varchar(2048);
 	declare l_commodity_guid	varchar(32);
 	declare l_commodity_scu		int(11);
 	declare l_placeholder		int(11);
-	declare l_count			tinyint default 2;
-	declare l_account_count		tinyint default 0; 
+	declare l_count			int default 2;
+	declare l_account_count		int default 0; 
 
 	-- call log( concat('DEBUG : START post_account(', ifnull(p_name, 'null'), ',', ifnull(p_account_type, 'null'), ',', ifnull(p_commodity_guid, 'null'), ')'));
 
@@ -7192,10 +7200,18 @@ procedure_block : begin
 			and get_account_type(guid) in ('ASSET', 'STOCK')
 			and not is_placeholder(guid)
 			and get_account_commodity(guid) != get_default_currency_guid()
-			and get_account_commodity(guid) != get_default_currency_guid()
-			-- if there are fewer units in acct now than day after gains were calced...
-			and get_account_units(guid, null, date_add(str_to_date(get_variable(concat('post_gain(', guid ,')')), '%Y-%m-%d %H:%i:%S'), interval 1 day)) >
-				get_account_units(guid, null, null);
+			-- only deal with last months transactions (as a safety feature)
+			and get_transaction_date(guid, 'LATEST', 'POST') > date_add(current_date, interval -1 month)
+			-- only if there are fewer units in acct now than day after gains were calced...
+			and 	get_account_units(guid, null, date_add(get_transaction_date(guid, 'LATEST', 'POST'), interval -1 day ))
+				> 
+				get_account_units(guid, null,  get_transaction_date(guid, 'LATEST', 'POST'))
+			-- and only for gains not already calced
+			and (	get_variable(concat('post_gain(', guid ,')')) is NULL
+				or
+				str_to_date(get_variable(concat('post_gain(', guid ,')')), '%Y-%m-%d %H:%i:%S') < get_transaction_date(guid, 'LATEST', 'POST')
+				);
+			-- and get_account_units(guid, null, date_add(str_to_date(get_variable(concat('post_gain(', guid ,')')), '%Y-%m-%d %H:%i:%S'), interval 1 day)) > get_account_units(guid, null, null);
 /*			and exists_transaction(
 				guid, 
 				get_account_guid(get_related_account(guid, 'CASH')),
@@ -7402,7 +7418,7 @@ procedure_block:begin
 	-- try to play nicely with other procedures
 	do is_locked('log', 'WAIT');
 
-	set l_date = ifnull(str_to_date(get_variable('Anomalies reported'), '%Y-%m-%d %H:%i:%S'), date_add(l_current_timestamp, interval -1 year));
+	set l_date = ifnull(str_to_date(get_variable('Anomalies reported'), '%Y-%m-%d %H:%i:%s'), date_add(l_current_timestamp, interval -1 year));
 	set l_error_level = upper(ifnull(get_variable('Error level'), 'ERROR'));
 
 	open lc_anomaly;	
@@ -7462,7 +7478,7 @@ procedure_block:begin
 
 		-- log the latest date anomalies have been checked for
 		call delete_variable('Anomalies reported');
-		call post_variable('Anomalies reported', date_format(l_current_timestamp, '%Y-%m-%d %H:%i:%S'));
+		call post_variable('Anomalies reported', date_format(l_current_timestamp, '%Y-%m-%d %H:%i:%s'));
 
 	end if; -- if l_report is not null
 
@@ -7721,7 +7737,11 @@ procedure_block : begin
 
 				-- call log( concat('DEBUG : l_capital_gains=', ifnull(l_capital_gains, 'null') ));
 
-				set l_unrealised_gains = l_account_value - l_remainder_cost;
+				if l_account_value > 0 then
+					set l_unrealised_gains = l_account_value - l_remainder_cost;
+				else
+					set l_unrealised_gains = 0;
+				end if;
 
 				if l_account_type = 'STOCK' then
 
@@ -8014,8 +8034,8 @@ create procedure report_remaining_isa_allowance
 procedure_block:begin
 	declare	l_report 			text;
 	declare l_isa_contribution 		decimal(20,6) default 0;
-	declare l_cash_accounts 		varchar(60000);
-	declare l_ISA_accounts 			varchar(60000);
+	declare l_cash_accounts 		text; -- varchar(60000);
+	declare l_ISA_accounts 			text; -- varchar(60000);
 	declare l_tax_year_start 		timestamp;
 	declare l_tax_year_end 			timestamp;
 	declare l_cash_account_counter 		smallint default 1;
@@ -8108,7 +8128,6 @@ procedure_block:begin
 	end if; -- if not exists_variable
 
 	-- call log('DEBUG : END report_remaining_isa_allowance');
-
 end;
 //
 set @procedure_count = ifnull(@procedure_count,0) + 1;
@@ -8121,7 +8140,7 @@ drop procedure if exists report_asset_allocation;
 create procedure report_asset_allocation
 	(
 		p_guid				varchar(32),
-		p_variable			varchar(2048),
+		p_variable			varchar(2048), -- concatenate variables with a comma
 		p_date				timestamp
 	)
 procedure_block : begin
@@ -8150,7 +8169,23 @@ procedure_block : begin
 							)
 						)
 					else
-						get_account_attribute(account_map.guid, p_variable)
+						case get_element_count( p_variable, ':')
+							when 1 then get_account_attribute(account_map.guid, p_variable)
+							when 2 then
+								concat(	get_account_attribute(account_map.guid,  get_element(p_variable, 1, ':') ), 
+									' ', 
+									get_account_attribute(account_map.guid,  get_element(p_variable, 2, ':') )
+								)
+							when 3 then
+								concat(	get_account_attribute(account_map.guid,  get_element(p_variable, 1, ':') ), 
+									' ', 
+									get_account_attribute(account_map.guid,  get_element(p_variable, 2, ':') ),
+									' ', 
+									get_account_attribute(account_map.guid,  get_element(p_variable, 3, ':') )
+								)
+
+						end
+							
 				end,
 				'UNKNOWN'
 			),
@@ -8276,10 +8311,10 @@ procedure_block : begin
 					'title');
 
 		-- delete previous iterations of report (only the latest is relevant)
-		call delete_series('report_asset_allocations', concat('1=', p_guid , ',2=', p_variable));
+		call delete_series('report_asset_allocation', concat('1=', p_guid , ',2=', p_variable));
 
 		-- write completed report to variables table
-		call post_variable( concat('report_asset_allocations(' , p_guid , ',' , p_variable , ',' , p_date , ')') , l_report);
+		call post_variable( concat('report_asset_allocation(' , p_guid , ',' , p_variable , ',' , p_date , ')') , l_report);
 
 	end if;
 
@@ -8299,7 +8334,7 @@ drop procedure if exists report_uk_tax;
 //
 create procedure report_uk_tax
 	(
-		p_index	tinyint
+		p_index	int
 	)
 procedure_block : begin
 	declare l_report_name 			varchar(700);
@@ -8469,7 +8504,7 @@ procedure_block : begin
 				ifnull(l_tax_rebates, 0);
 
 	-- calculate tax to be paid
-	-- very much a WIP as UK tax rules are as mad as a honeynut loop
+	-- very much a WIP as UK tax rules are as mad as a honeynut loop and constantly changing
 	-- until such time as Ive worked them out, inputting the above values into the HMRC SA form should do the calc for me
 /*
 	-- personal allowance (nil tax rate band) reduces by £1 for every £2 income over the personal allowance limit
@@ -8791,7 +8826,7 @@ create procedure report_target_allocations
 	)
 procedure_block : begin
 	
-	declare l_performance_sensitivity		tinyint default 0; 
+	declare l_performance_sensitivity		int default 0; 
 
 	declare	l_account_guid				varchar(32);
 	declare	l_commodity_guid			varchar(32);
@@ -8817,7 +8852,7 @@ procedure_block : begin
 	declare	l_sold_cost				decimal(20,6);
 	declare	l_average_cost				decimal(20,6);
 
-	-- declare l_performance_signal			tinyint;
+	-- declare l_performance_signal			int;
 	-- declare l_ppo_signal				text;
 	-- declare l_so_signal				text;
 
@@ -9144,7 +9179,7 @@ procedure_block : begin
 	declare l_view_done_temp 	boolean default false;
 	declare l_views_changed		boolean default false;
 	declare l_tables_checked	boolean default false;
-	declare l_views_required	tinyint default 0;
+	declare l_views_required	int default 0;
 	
 	declare lc_view cursor for
 		select distinct table_name 
@@ -9349,7 +9384,7 @@ create procedure reschedule()
 procedure_block: begin
 
 	declare l_event_name			varchar(64);
-	declare l_event_hour			varchar(2);
+	declare l_event_hour			int;
 	declare l_event_last_execution_date	varchar(20);
 	declare l_interval_value		varchar(256);
 	declare l_interval_field		varchar(18);
@@ -9358,7 +9393,7 @@ procedure_block: begin
 
 	declare lc_events cursor for
 		select 	events.event_name,
-			date_format(events.starts,'%H'),
+			hour(events.starts),
 			date_format(ifnull(events.last_executed, starts),'%Y-%m-%d %H:%i:%S'),
 			events.interval_value,
 			events.interval_field
@@ -9401,34 +9436,36 @@ procedure_block: begin
 					l_interval_field,
 					'), ''%Y-%m-%d %H:%i:%S'') into @g_expected_execution_date'
 				);
+		-- call log( concat('DEBUG: [1] @g_sql="', @g_sql, '"'));
 		prepare d_sql from @g_sql;
 		execute d_sql;
 			
 		-- if time has passed the expected execution date, force it to run at the next available time that agrees with the original start hour
 		if current_timestamp > str_to_date(@g_expected_execution_date, '%Y-%m-%d %H:%i:%S') then
 
+			-- Mariadb 10.1.30 : #1295 - This command is not supported in the prepared statement protocol yet
 			-- bring schedule forward
-			set @g_sql = concat(
-					'alter event ', l_event_name,
-					' on schedule every ', l_interval_value , ' ', l_interval_field,
-					' starts ', 
-					if(	extract(hour from current_timestamp) < l_event_hour,
-						date_add( from_days(to_days( current_timestamp )), interval l_event_hour hour ),
-						date_add( from_days(to_days( current_timestamp )), interval (24 + l_event_hour) hour )
-					)
-				);
-
-			prepare d_sql from @g_sql;
-			execute d_sql;
-
-			-- MySQL doesnt (yet) support inline procedure creation or begin..end blocks
-			-- set @g_sql = trim(regexp_replace(l_event_definition, '(begin|end)\s?(\r|$)', ''));
-			-- call log( concat('DEBUG : ', @g_sql));
+			-- set @g_sql = concat(
+			--		'alter event ', l_event_name,
+			--		' on schedule every ', l_interval_value , ' ', l_interval_field,
+			--		' starts str_to_date( ''', 
+			--			if(	hour(current_timestamp) < l_event_hour,
+			--				date_add( from_days(to_days( current_timestamp )), interval l_event_hour hour ),
+			--				date_add( from_days(to_days( current_timestamp )), interval (24 + l_event_hour) hour )
+			--			),
+			--		''', ''%Y-%m-%d %H:%i:%S'')'
+			--	);
+			-- call log( concat('DEBUG: [2] @g_sql="', @g_sql, '"'));
 			-- prepare d_sql from @g_sql;
-			-- execute d_sql;	
-			-- call log( concat('INFORMATION : resubmitted event ', l_event_name ));
+			-- execute d_sql;
 
-			call log(  concat('WARNING : event ', l_event_name, ' did not run at expected time ', @g_expected_execution_date, ' and has been rescheduled.' ));
+			-- - set @g_sql = trim(regexp_replace(l_event_definition, '(begin|end)\s?(\r|$)', ''));
+			-- - call log( concat('DEBUG : ', @g_sql));
+			-- - prepare d_sql from @g_sql;
+			-- - execute d_sql;	
+			-- - call log( concat('INFORMATION : resubmitted event ', l_event_name ));
+
+			call log(  concat('WARNING : event ''', l_event_name, ''' did not run at expected time ''', @g_expected_execution_date, '''.'));
 		end if;
 	
 		set l_events_done = l_events_done_temp;
@@ -9608,7 +9645,7 @@ procedure_block : begin
 	declare l_text1		varchar(500);
 	declare	l_err_code	char(5) default '00000';
 	declare l_err_msg	text;
-	declare l_count		tinyint default 0;
+	declare l_count		int default 0;
 
 	-- dont barf on error for this test procedure; just log what went wrong and continue
 	declare continue handler for SQLEXCEPTION
@@ -10259,8 +10296,9 @@ begin
 	-- call log('DEBUG : START EVENT report_asset_allocations');
 	if get_lock('customgnucash_event', 600)
 	then
-		call report_asset_allocation( get_account_guid('Assets'), 'Asset class', current_timestamp );
 		call report_asset_allocation( get_account_guid('Assets'), 'Location', current_timestamp );
+		call report_asset_allocation( get_account_guid('Assets'), 'Asset class', current_timestamp );
+		call report_asset_allocation( get_account_guid('Assets'), 'Location:Asset class', current_timestamp );
 	end if;
 
 	do release_lock('customgnucash_event');
@@ -10499,6 +10537,10 @@ call post_variable ('ISA allowance 2014','11800'); -- 2013/2014 ISA allowance
 call post_variable ('ISA allowance 2015','15000'); -- 2014/2015 ISA allowance
 //
 call post_variable ('ISA allowance 2016','15240'); -- 2015/2016 ISA allowance
+//
+call post_variable ('ISA allowance 2017','20000'); -- 2016/2017 ISA allowance
+//
+call post_variable ('ISA allowance 2018','20000'); -- 2016/2017 ISA allowance
 //
 
 -- Pension account(s)
